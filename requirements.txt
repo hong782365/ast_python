@@ -2,3 +2,8 @@ websockets
 protobuf
 python-dotenv
 yt-dlp
+pyaudio
+pydub
+simpleaudio
+sounddevice
+numpy
