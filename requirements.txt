@@ -1,3 +1,4 @@
 websockets 
 protobuf
 python-dotenv
+yt-dlp
