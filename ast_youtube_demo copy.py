@@ -173,10 +173,8 @@ async def send_request(ws, request: TranslateRequestData):
     request_data.source_audio.channel = 1
     if request.source_audio and request.source_audio.binary_data:
         request_data.source_audio.binary_data = request.source_audio.binary_data
-    request_data.target_audio.format = "pcm"
-    request_data.target_audio.rate = 16000
-    request_data.target_audio.bits = 16
-    request_data.target_audio.channel = 1
+    request_data.target_audio.format = "ogg_opus"
+    request_data.target_audio.rate = 24000
     request_data.request.mode = "s2s"
     request_data.request.source_language = "zh"
     request_data.request.target_language = "en"
@@ -222,145 +220,8 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640):
             logging.error(f"Error reading PCM chunk: {e}")
             break
 
-async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None):
-    """Generator function that yields translated audio chunks from YouTube live stream"""
-    streamer = YouTubeLiveStreamer(youtube_url, duration_seconds or 3600)  # Default 1 hour
-    
-    try:
-        # Start streaming pipeline
-        pcm_stream = await streamer.start_streaming_pipeline()
-        
-        # Connect to WebSocket server
-        conn_id = str(uuid.uuid4())
-        headers = await build_http_headers(conf, conn_id)
-        
-        conn = await websockets.connect(
-            conf.ws_url,
-            additional_headers=headers,
-            max_size=1000000000,
-            ping_interval=None
-        )
-        
-        logging.info(f"Connected to translation server (log id={conn.response.headers.get('X-Tt-Logid')})")
-        log_id = conn.response.headers.get('X-Tt-Logid')
-        
-        session_id = str(uuid.uuid4())
-        
-        # Start session
-        start_request = TranslateRequestData(
-            session_id=session_id,
-            event="Type_StartSession",
-            source_audio=Audio(format="wav", rate=16000, bits=16, channel=1),
-            target_audio=Audio(format="pcm", rate=16000, bits=16, channel=1),
-            mode="s2s",
-            source_language="zh",
-            target_language="en"
-        )
-        
-        await send_request(conn, start_request)
-        resp = await receive_message(conn)
-        if resp.event != Type.SessionStarted:
-            logging.error(f"Unexpected response logid: {log_id}")
-            logging.error(f"Unexpected response: {resp.event}")
-            logging.error(f"Unexpected response message: {resp.message}")
-            await conn.close()
-            return
-        
-        logging.info(f"Translation session (ID={session_id}) started.")
-        
-        # Create queues for communication between sender and receiver
-        audio_queue = asyncio.Queue()
-        finished = asyncio.Event()
-        
-        async def send_pcm_chunks():
-            chunk_count = 0
-            try:
-                logging.info("Starting to read PCM chunks from ffmpeg...")
-                async for chunk in read_pcm_chunks(pcm_stream):
-                    if not chunk:
-                        logging.info("No more PCM chunks available")
-                        break
-                    
-                    chunk_count += 1
-                    logging.debug(f"Sending PCM chunk {chunk_count}: {len(chunk)} bytes")
-                    
-                    chunk_request = TranslateRequestData(
-                        session_id=session_id,
-                        event="Type_TaskRequest",
-                        source_audio=Audio(binary_data=chunk)
-                    )
-                    await send_request(conn, chunk_request)
-                    await asyncio.sleep(0.02)  # 20ms delay to match chunk rate
-                
-                logging.info(f"Finished sending {chunk_count} PCM chunks")
-                
-                # Send finish session
-                finish_request = TranslateRequestData(
-                    session_id=session_id,
-                    event="Type_FinishSession",
-                    source_audio=Audio()
-                )
-                await send_request(conn, finish_request)
-                logging.info("FinishSession request sent.")
-                
-            except Exception as e:
-                logging.error(f"Error sending PCM chunks: {e}")
-                finished.set()
-        
-        async def receive_responses():
-            try:
-                while not finished.is_set():
-                    resp = await receive_message(conn)
-                    
-                    logging.debug(
-                        f"Received message (event={resp.event}, session_id={resp.session_id}): "
-                        f"seq: {resp.sequence}, text: '{resp.text}', audio data length: {len(resp.data)}"
-                    )
-                    
-                    if resp.event == Type.SessionFailed or resp.event == Type.SessionCanceled:
-                        logging.error(f"Session failed, message: {resp.message} logid: {log_id}")
-                        finished.set()
-                        break
-                    
-                    if resp.event == Type.SessionFinished:
-                        logging.info("Translation session finished")
-                        finished.set()
-                        break
-                    
-                    # Yield translated audio data
-                    if resp.data:
-                        await audio_queue.put(resp.data)
-                        
-            except Exception as e:
-                logging.error(f"Receive message error: {e}")
-                finished.set()
-        
-        # Start sender and receiver tasks
-        sender_task = asyncio.create_task(send_pcm_chunks())
-        receiver_task = asyncio.create_task(receive_responses())
-        
-        # Yield audio chunks as they arrive
-        try:
-            while not finished.is_set():
-                try:
-                    # Wait for audio chunk with timeout
-                    audio_chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
-                    yield audio_chunk
-                except asyncio.TimeoutError:
-                    continue
-        finally:
-            finished.set()
-            await sender_task
-            await receiver_task
-            await conn.close()
-            
-    except Exception as e:
-        logging.error(f"Translation streaming error: {e}")
-    finally:
-        await streamer.cleanup()
-
 async def translate_youtube_live(conf: Config, youtube_url: str, duration_seconds: int = 10, out_dir: str = "output"):
-    """Main translation function for YouTube live stream (backward compatibility)"""
+    """Main translation function for YouTube live stream"""
     streamer = YouTubeLiveStreamer(youtube_url, duration_seconds)
     
     try:
@@ -388,7 +249,7 @@ async def translate_youtube_live(conf: Config, youtube_url: str, duration_second
             session_id=session_id,
             event="Type_StartSession",
             source_audio=Audio(format="wav", rate=16000, bits=16, channel=1),
-            target_audio=Audio(format="pcm", rate=16000, bits=16, channel=1),
+            target_audio=Audio(format="ogg_opus", rate=24000),
             mode="s2s",
             source_language="zh",
             target_language="en"
