@@ -36,9 +36,6 @@ logs/
 *.txt
 !requirements.txt
 
-# 测试
-test/
-
 # 素材
 *.wav
 *.opus

@@ -84,25 +84,34 @@ class YouTubeLiveStreamer:
         
         # yt-dlp command to extract live audio
         yt_dlp_cmd = [
-            "yt-dlp",
-            "-f", "91/92/93/94/bestaudio",  # Try formats that work with this stream
-            "--no-part", "--no-keep-fragments", "--no-live-from-start",
-            "-o", "-",
-            self.youtube_url
+            "yt-dlp",  # yt-dlp 主程序
+            "-f", "bestaudio",  # 格式选择：拿音频直链
+            "--no-part",  # 不使用 .part 临时文件
+            "--no-keep-fragments",  # 不保留片段文件
+            "--no-live-from-start",  # 不从直播开始下载，而是从当前时间点开始
+            "--ffmpeg-location", "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg",  # 指定 ffmpeg 可执行文件路径
+            "-o", "-",  # 输出到标准输出（管道）
+            self.youtube_url  # YouTube 直播 URL
         ]
         
         # ffmpeg command to convert to 16kHz mono PCM
         ffmpeg_cmd = [
-            "ffmpeg",
-            "-hide_banner", "-loglevel", "error",
-            "-fflags", "+nobuffer", "-flags", "low_delay",
-            "-probesize", "32k", "-analyzeduration", "0",
-            "-i", "pipe:0",
-            "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-f", "s16le",
-            "-af", "aresample=async=1:min_comp=0.001:first_pts=0",
-            "-t", str(self.duration_seconds),  # Limit duration for testing
-            "-y",  # Overwrite output files
-            "pipe:1"
+            "ffmpeg",  # ffmpeg 主程序
+            "-hide_banner",  # 隐藏 ffmpeg 启动横幅信息
+            "-loglevel", "error",  # 日志级别设为仅显示错误
+            "-fflags", "+nobuffer",  # 格式标志：禁用缓冲以减少延迟
+            "-flags", "low_delay",  # 编码标志：低延迟模式
+            "-probesize", "32k",  # 探测输入格式时读取的数据量（32KB）
+            "-analyzeduration", "0",  # 分析输入流的持续时间（0=不分析，减少延迟）
+            "-i", "pipe:0",  # 输入源：从标准输入（管道）读取
+            "-ac", "1",  # 音频通道数：1（单声道）
+            "-ar", "16000",  # 音频采样率：16000Hz
+            "-acodec", "pcm_s16le",  # 音频编码器：16位小端序 PCM
+            "-f", "s16le",  # 输出格式：16位小端序原始音频
+            "-af", "aresample=async=1:min_comp=0.001:first_pts=0",  # 音频滤镜：异步重采样，最小补偿0.001，首个PTS为0
+            "-t", str(self.duration_seconds),  # 限制处理时长（秒）
+            "-y",  # 覆盖输出文件（如果存在）
+            "pipe:1"  # 输出到标准输出（管道）
         ]
         
         try:
