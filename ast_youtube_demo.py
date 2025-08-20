@@ -78,65 +78,87 @@ class YouTubeLiveStreamer:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         
     async def start_streaming_pipeline(self):
-        """Start yt-dlp + ffmpeg pipeline for PCM streaming"""
+        """Start yt-dlp (extract URL) + ffmpeg (direct network pull) pipeline for PCM streaming"""
         timestamp = time.strftime("%Y%m%dT%H%M%SZ")
         yt_dlp_log = self.log_dir / f"yt-dlp_{timestamp}.log"
         
-        # yt-dlp command to extract live audio
+        # Step 1: Use yt-dlp to extract direct stream URL only
         yt_dlp_cmd = [
             "yt-dlp",  # yt-dlp 主程序
-            "-f", "bestaudio",  # 格式选择：拿音频直链
-            "--no-part",  # 不使用 .part 临时文件
-            "--no-keep-fragments",  # 不保留片段文件
-            "--no-live-from-start",  # 不从直播开始下载，而是从当前时间点开始
+            "-f", "234/233/140/bestaudio[ext=m4a]/bestaudio",  # 优先选择纯音频流：234(高质量)>233(低质量)>140>m4a>最佳音频
+            "--get-url",  # 只获取直链URL，不下载
+            "--no-warnings",  # 不显示警告信息
             "--ffmpeg-location", "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg",  # 指定 ffmpeg 可执行文件路径
-            "-o", "-",  # 输出到标准输出（管道）
             self.youtube_url  # YouTube 直播 URL
         ]
         
-        # ffmpeg command to convert to 16kHz mono PCM
-        ffmpeg_cmd = [
-            "ffmpeg",  # ffmpeg 主程序
-            "-hide_banner",  # 隐藏 ffmpeg 启动横幅信息
-            "-loglevel", "error",  # 日志级别设为仅显示错误
-            "-fflags", "+nobuffer",  # 格式标志：禁用缓冲以减少延迟
-            "-flags", "low_delay",  # 编码标志：低延迟模式
-            "-probesize", "32k",  # 探测输入格式时读取的数据量（32KB）
-            "-analyzeduration", "0",  # 分析输入流的持续时间（0=不分析，减少延迟）
-            "-i", "pipe:0",  # 输入源：从标准输入（管道）读取
-            "-ac", "1",  # 音频通道数：1（单声道）
-            "-ar", "16000",  # 音频采样率：16000Hz
-            "-acodec", "pcm_s16le",  # 音频编码器：16位小端序 PCM
-            "-f", "s16le",  # 输出格式：16位小端序原始音频
-            "-af", "aresample=async=1:min_comp=0.001:first_pts=0",  # 音频滤镜：异步重采样，最小补偿0.001，首个PTS为0
-            "-t", str(self.duration_seconds),  # 限制处理时长（秒）
-            "-y",  # 覆盖输出文件（如果存在）
-            "pipe:1"  # 输出到标准输出（管道）
-        ]
-        
         try:
-            # Start yt-dlp process with stderr redirected to log file
+            # Extract direct stream URL using yt-dlp
+            logging.info("Extracting direct stream URL with yt-dlp...")
             with open(yt_dlp_log, 'w') as log_file:
-                self.yt_dlp_process = subprocess.Popen(
+                yt_dlp_result = subprocess.run(
                     yt_dlp_cmd,
                     stdout=subprocess.PIPE,
                     stderr=log_file,
-                    bufsize=0
+                    text=True,
+                    timeout=30  # 30秒超时
                 )
             
-            # Start ffmpeg process
+            if yt_dlp_result.returncode != 0:
+                raise Exception(f"yt-dlp failed with return code: {yt_dlp_result.returncode}")
+            
+            # Get the direct stream URL
+            direct_url = yt_dlp_result.stdout.strip()
+            if not direct_url:
+                raise Exception("Failed to extract direct stream URL")
+            
+            logging.info(f"Extracted direct stream URL: {direct_url[:100]}...")
+            
+            # Step 2: Use ffmpeg to directly pull from network with reconnect parameters
+            ffmpeg_cmd = [
+                "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg",  # ffmpeg 主程序
+                "-hide_banner",  # 隐藏 ffmpeg 启动横幅信息
+                "-loglevel", "error",  # 恢复详细日志以诊断问题
+                "-http_proxy", "http://127.0.0.1:7897",
+                "-i", direct_url,  # 输入源：直接从网络URL读取
+                "-ac", "1",  # 音频通道数：1（单声道）
+                "-ar", "16000",  # 音频采样率：16000Hz
+                "-acodec", "pcm_s16le",  # 音频编码器：16位小端序 PCM
+                "-f", "s16le",  # 输出格式：16位小端序原始音频
+                "-t", str(self.duration_seconds),  # 限制处理时长（秒）
+                "-y",  # 覆盖输出文件（如果存在）
+                "pipe:1"  # 输出到标准输出（管道）
+            ]
+            
+            # Start ffmpeg process directly with network stream
+            logging.info("Starting ffmpeg with direct network stream...")
+            logging.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+            
             self.ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdin=self.yt_dlp_process.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0
             )
             
-            # Close yt-dlp stdout in parent process to allow proper pipe communication
-            self.yt_dlp_process.stdout.close()
+            # No need for yt-dlp process anymore
+            self.yt_dlp_process = None
             
-            logging.info(f"Started streaming pipeline, yt-dlp logs: {yt_dlp_log}")
+            # Wait longer for ffmpeg to initialize and start processing HLS stream
+            await asyncio.sleep(5.0)  # Give ffmpeg more time to initialize HLS stream
+            if self.ffmpeg_process.poll() is not None:
+                # ffmpeg process has already exited
+                stderr_output = self.ffmpeg_process.stderr.read().decode('utf-8', errors='ignore')
+                logging.error(f"FFmpeg process exited early with code: {self.ffmpeg_process.returncode}")
+                logging.error(f"FFmpeg stderr: {stderr_output}")
+                raise Exception(f"FFmpeg failed to start: {stderr_output}")
+            
+            logging.info(f"FFmpeg process started successfully (PID: {self.ffmpeg_process.pid})")
+            
+            # Start a background task to monitor ffmpeg stderr
+            asyncio.create_task(self._monitor_ffmpeg_stderr())
+            
+            logging.info(f"Started direct network streaming pipeline, yt-dlp logs: {yt_dlp_log}")
             return self.ffmpeg_process.stdout
             
         except Exception as e:
@@ -144,6 +166,32 @@ class YouTubeLiveStreamer:
             await self.cleanup()
             raise
     
+    async def _monitor_ffmpeg_stderr(self):
+        """Monitor ffmpeg stderr output in the background"""
+        if not self.ffmpeg_process or not self.ffmpeg_process.stderr:
+            return
+            
+        try:
+            while self.ffmpeg_process.poll() is None:
+                # Read stderr with timeout
+                try:
+                    loop = asyncio.get_event_loop()
+                    line = await asyncio.wait_for(
+                        loop.run_in_executor(None, self.ffmpeg_process.stderr.readline),
+                        timeout=1.0
+                    )
+                    if line:
+                        line_str = line.decode('utf-8', errors='ignore').strip()
+                        if line_str:
+                            logging.info(f"FFmpeg: {line_str}")
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logging.error(f"Error reading ffmpeg stderr: {e}")
+                    break
+        except Exception as e:
+            logging.error(f"FFmpeg stderr monitor error: {e}")
+            
     async def cleanup(self):
         """Clean up subprocess resources"""
         if self.ffmpeg_process:
@@ -219,17 +267,51 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640):
     """Read PCM data in chunks (640 bytes = 20ms at 16kHz mono s16le)"""
     import asyncio
     loop = asyncio.get_event_loop()
+    chunk_count = 0
+    
+    logging.info(f"Starting PCM chunk reading, chunk_size: {chunk_size}")
     
     while True:
         try:
-            # Use run_in_executor to make blocking read non-blocking
-            chunk = await loop.run_in_executor(None, pcm_stream.read, chunk_size)
-            if not chunk:
+            # Use run_in_executor to make blocking read non-blocking with timeout
+            logging.debug(f"Attempting to read PCM chunk {chunk_count + 1}...")
+            
+            # Add timeout to detect if ffmpeg is stuck
+            try:
+                # Use much longer timeout for first chunk to skip through ad segments
+                timeout_duration = 12.0 if chunk_count == 0 else 10.0
+                chunk = await asyncio.wait_for(
+                    loop.run_in_executor(None, pcm_stream.read, chunk_size),
+                    timeout=timeout_duration
+                )
+            except asyncio.TimeoutError:
+                if chunk_count == 0:
+                    logging.error("Timeout waiting for first PCM chunk - ffmpeg may be stuck or stream unavailable")
+                else:
+                    logging.error(f"Timeout reading PCM chunk {chunk_count + 1} - stream may have ended")
                 break
+            
+            if not chunk:
+                logging.info(f"PCM stream ended after {chunk_count} chunks")
+                break
+                
+            chunk_count += 1
+            if chunk_count == 1:
+                logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes")
+            elif chunk_count % 50 == 0:
+                logging.info(f"Successfully read PCM chunk {chunk_count}: {len(chunk)} bytes")
+            else:
+                logging.debug(f"Successfully read PCM chunk {chunk_count}: {len(chunk)} bytes")
+            
             yield chunk
+            
         except Exception as e:
-            logging.error(f"Error reading PCM chunk: {e}")
+            logging.error(f"Error reading PCM chunk {chunk_count}: {e}")
+            import traceback
+            logging.error(f"PCM read traceback: {traceback.format_exc()}")
             break
+    
+    logging.info(f"PCM chunk reading completed, total chunks: {chunk_count}")
 
 async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None):
     """Generator function that yields translated audio chunks from YouTube live stream"""
@@ -283,15 +365,31 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         
         async def send_pcm_chunks():
             chunk_count = 0
+            total_bytes = 0
             try:
                 logging.info("Starting to read PCM chunks from ffmpeg...")
+                
+                # Check if ffmpeg process is still running
+                if streamer.ffmpeg_process.poll() is not None:
+                    stderr_output = streamer.ffmpeg_process.stderr.read().decode('utf-8', errors='ignore')
+                    logging.error(f"FFmpeg process has exited with code: {streamer.ffmpeg_process.returncode}")
+                    logging.error(f"FFmpeg stderr: {stderr_output}")
+                    finished.set()
+                    return
+                
                 async for chunk in read_pcm_chunks(pcm_stream):
                     if not chunk:
                         logging.info("No more PCM chunks available")
                         break
                     
                     chunk_count += 1
-                    logging.debug(f"Sending PCM chunk {chunk_count}: {len(chunk)} bytes")
+                    total_bytes += len(chunk)
+                    
+                    # Log every 50 chunks (about 1 second of audio)
+                    if chunk_count % 50 == 0:
+                        logging.info(f"Sent {chunk_count} PCM chunks, {total_bytes} total bytes")
+                    else:
+                        logging.debug(f"Sending PCM chunk {chunk_count}: {len(chunk)} bytes")
                     
                     chunk_request = TranslateRequestData(
                         session_id=session_id,
@@ -301,7 +399,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     await send_request(conn, chunk_request)
                     await asyncio.sleep(0.02)  # 20ms delay to match chunk rate
                 
-                logging.info(f"Finished sending {chunk_count} PCM chunks")
+                logging.info(f"Finished sending {chunk_count} PCM chunks, total {total_bytes} bytes")
                 
                 # Send finish session
                 finish_request = TranslateRequestData(
@@ -314,6 +412,8 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                 
             except Exception as e:
                 logging.error(f"Error sending PCM chunks: {e}")
+                import traceback
+                logging.error(f"Send chunks traceback: {traceback.format_exc()}")
                 finished.set()
         
         async def receive_responses():
