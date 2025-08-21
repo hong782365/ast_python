@@ -22,6 +22,9 @@ ACCESS_KEY = os.getenv("ACCESS_KEY")
 RESOURCE_ID = os.getenv("RESOURCE_ID")
 WS_URL = os.getenv("WS_URL")
 
+SOURCE_LANGUAGE="en"
+TARGET_LANGUAGE="zh"
+
 # 获取当前脚本所在目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -291,30 +294,82 @@ class YouTubeLiveStreamer:
         # Step 1: Use yt-dlp to extract direct stream URL only
         yt_dlp_cmd = [
             "yt-dlp",  # yt-dlp 主程序
+            "--force-ipv4",  # 避开慢 IPv6, 预期收益: -3～10s
             "-f", "234/233/140/bestaudio[ext=m4a]/bestaudio",  # 优先选择纯音频流：234(高质量)>233(低质量)>140>m4a>最佳音频
             "--get-url",  # 只获取直链URL，不下载
             "--no-warnings",  # 不显示警告信息
-            "--ffmpeg-location", "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg",  # 指定 ffmpeg 可执行文件路径
+            # 下面这个参数有问题, 总是失败. 虽然 ChatGPT-5 说它没问题, 但在我这里有问题. 暂时先注释掉, 后面改成 yt-dlp 库模式 + 常驻实例 + 预热 的版本之后再做 A/B 测试.
+            # "--extractor-args", "youtube:player_client=ios,android,web;player_skip=webpage",  # 跳过 HTML, 预期收益: -2～8s  
+                                                                                                # 正确写法：同一站点（youtube）的多个“键=值”用 分号 ; 分隔；同一个键的多个值用 逗号 , 分隔。  
+                                                                                                # 客户端顺序真的有用：很多直播在 iOS 客户端下会给完整的 HLS 音频清单，而 web/TV 可能被 SABR/DRM 实验影响；把 ios 放在最前面，命中率更高。
+            "--cookies-from-browser", "chrome",  # 避免同意页, 预期收益: -1～3s
+            "--verbose",  # --verbose 会强制 yt-dlp 输出更详细的日志，非常适合调试
             self.youtube_url  # YouTube 直播 URL
         ]
         
         try:
-            # Extract direct stream URL using yt-dlp
+            # Extract direct stream URL using yt-dlp with Popen for real-time control
             logging.info("Extracting direct stream URL with yt-dlp...")
-            with open(yt_dlp_log, 'w') as log_file:
-                yt_dlp_result = subprocess.run(
-                    yt_dlp_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=log_file,
-                    text=True,
-                    timeout=30  # 30秒超时
-                )
             
-            if yt_dlp_result.returncode != 0:
-                raise Exception(f"yt-dlp failed with return code: {yt_dlp_result.returncode}")
+            # Open log file for stderr redirection
+            yt_dlp_log_file = open(yt_dlp_log, 'w')
             
-            # Get the direct stream URL
-            direct_url = yt_dlp_result.stdout.strip()
+            # Start yt-dlp process with Popen for real-time stdout control
+            yt_dlp_process = subprocess.Popen(
+                yt_dlp_cmd,
+                stdout=subprocess.PIPE,
+                stderr=yt_dlp_log_file,
+                text=True
+            )
+            
+            logging.info(f"🎬 yt-dlp process started (PID: {yt_dlp_process.pid})")
+            logging.info(f"🎬 yt-dlp stderr log: {yt_dlp_log}")
+            
+            # Start background task to monitor yt-dlp stderr for real-time feedback
+            ytdlp_stderr_monitor_task = asyncio.create_task(
+                self._monitor_ytdlp_stderr(yt_dlp_log, yt_dlp_process)
+            )
+            
+            # Read stdout in real-time with timeout
+            direct_url = ""
+            try:
+                # Monitor yt-dlp process with real-time feedback
+                start_time = time.time()
+                logging.info("🎬 Waiting for yt-dlp to extract direct stream URL...")
+                
+                # Wait for process completion with timeout
+                stdout, stderr = yt_dlp_process.communicate(timeout=30)  # 30秒超时
+                
+                elapsed_time = time.time() - start_time
+                logging.info(f"🎬 yt-dlp completed in {elapsed_time:.2f}s")
+                
+                direct_url = stdout.strip()
+                
+                # Check return code after process completion
+                if yt_dlp_process.returncode != 0:
+                    logging.error(f"🎬 yt-dlp failed with return code: {yt_dlp_process.returncode}")
+                    logging.error(f"🎬 Check yt-dlp stderr log: {yt_dlp_log}")
+                    raise Exception(f"yt-dlp failed with return code: {yt_dlp_process.returncode}")
+                else:
+                    logging.info(f"🎬 yt-dlp succeeded (return code: 0)")
+                    
+            except subprocess.TimeoutExpired:
+                # Kill the process if it times out
+                logging.error("🎬 yt-dlp process timed out after 30 seconds, killing process...")
+                yt_dlp_process.kill()
+                yt_dlp_process.wait()
+                logging.error(f"🎬 yt-dlp process killed (PID: {yt_dlp_process.pid})")
+                raise Exception("yt-dlp process timed out after 30 seconds")
+            finally:
+                # Always close the log file
+                yt_dlp_log_file.close()
+                
+                # Wait for stderr monitor to complete
+                try:
+                    await ytdlp_stderr_monitor_task
+                except Exception as e:
+                    logging.warning(f"🎬 Error waiting for yt-dlp stderr monitor: {e}")
+            
             if not direct_url:
                 raise Exception("Failed to extract direct stream URL")
             
@@ -473,6 +528,71 @@ class YouTubeLiveStreamer:
         
         logging.info("🔧 FFmpeg console log monitor ended")
     
+    async def _monitor_ytdlp_stderr(self, console_log_path, ytdlp_process):
+        """Monitor yt-dlp stderr log file in real-time for better debugging"""
+        if not ytdlp_process:
+            logging.warning("🎬 yt-dlp stderr monitor: No process available")
+            return
+            
+        logging.info(f"🎬 Starting yt-dlp stderr monitor for PID {ytdlp_process.pid}")
+        logging.info(f"🎬 Monitoring log file: {console_log_path}")
+        
+        try:
+            line_count = 0
+            last_position = 0
+            
+            while ytdlp_process.poll() is None:
+                try:
+                    # Check if log file exists and read new lines
+                    if os.path.exists(console_log_path):
+                        with open(console_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            f.seek(last_position)
+                            new_lines = f.readlines()
+                            last_position = f.tell()
+                            
+                            for line in new_lines:
+                                line_str = line.strip()
+                                if line_str:
+                                    line_count += 1
+                                    # Categorize different types of yt-dlp messages
+                                    if "error" in line_str.lower() or "failed" in line_str.lower():
+                                        logging.error(f"🎬 yt-dlp ERROR: {line_str}")
+                                    elif "warning" in line_str.lower():
+                                        logging.warning(f"🎬 yt-dlp WARNING: {line_str}")
+                                    elif "extracting" in line_str.lower() or "downloading" in line_str.lower():
+                                        logging.info(f"🎬 yt-dlp PROGRESS: {line_str}")
+                                    else:
+                                        logging.debug(f"🎬 yt-dlp: {line_str}")
+                    
+                    # Wait a bit before checking again
+                    await asyncio.sleep(0.5)  # Check more frequently for yt-dlp
+                    
+                except Exception as e:
+                    logging.error(f"🎬 Error reading yt-dlp stderr log: {e}")
+                    await asyncio.sleep(1.0)  # Wait longer on error
+            
+            # Process has exited, read any remaining log content
+            final_exit_code = ytdlp_process.returncode
+            logging.info(f"🎬 yt-dlp process exited with code: {final_exit_code}, total log lines processed: {line_count}")
+            
+            # Read any final content from the log file
+            try:
+                if os.path.exists(console_log_path):
+                    with open(console_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        f.seek(last_position)
+                        remaining_content = f.read()
+                        if remaining_content.strip():
+                            logging.info(f"🎬 Final yt-dlp log content: {remaining_content}")
+            except Exception as e:
+                logging.error(f"🎬 Error reading final log content: {e}")
+                
+        except Exception as e:
+            logging.error(f"🎬 yt-dlp stderr monitor error: {e}")
+            import traceback
+            logging.error(f"🎬 Monitor traceback: {traceback.format_exc()}")
+        
+        logging.info("🎬 yt-dlp stderr monitor ended")
+
     async def _monitor_ffmpeg_health(self):
         """Monitor FFmpeg process health and network connectivity"""
         if not self.ffmpeg_process:
@@ -580,8 +700,8 @@ async def send_request(ws, request: TranslateRequestData):
     request_data.target_audio.bits = 16
     request_data.target_audio.channel = 1
     request_data.request.mode = "s2s"
-    request_data.request.source_language = "zh"
-    request_data.request.target_language = "en"
+    request_data.request.source_language = SOURCE_LANGUAGE
+    request_data.request.target_language = TARGET_LANGUAGE
     await ws.send(request_data.SerializeToString())
 
 async def receive_message(ws) -> TranslateResponseData:
@@ -807,8 +927,8 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             source_audio=Audio(format="wav", rate=16000, bits=16, channel=1),
             target_audio=Audio(format="pcm", rate=16000, bits=16, channel=1),
             mode="s2s",
-            source_language="zh",
-            target_language="en"
+            source_language=SOURCE_LANGUAGE,
+            target_language=TARGET_LANGUAGE
         )
         
         # 记录发送StartSession事件
@@ -987,8 +1107,8 @@ async def translate_youtube_live(conf: Config, youtube_url: str, duration_second
             source_audio=Audio(format="wav", rate=16000, bits=16, channel=1),
             target_audio=Audio(format="pcm", rate=16000, bits=16, channel=1),
             mode="s2s",
-            source_language="zh",
-            target_language="en"
+            source_language=SOURCE_LANGUAGE,
+            target_language=TARGET_LANGUAGE
         )
         
         await send_request(conn, start_request)
