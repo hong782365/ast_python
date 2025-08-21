@@ -238,6 +238,32 @@ class ASTEventLogger:
             # 从message中提取静音时长（如果有的话）
             if response_data.message:
                 json_data["message"] = response_data.message
+                
+        elif event_type == Type.UsageResponse:
+            # ~~>> 计量计费-UsageResponse: TranslateResponseData(event=154, session_id='f3edfd77-e77f-4af3-aa6d-5bf3472fae83', sequence=0, text='', data=b'', message='OK', start_time=0, end_time=0)
+            # 打印的数据里根本没有费用相关的字段, 和文档里的返回结构不一致. 
+            # 说明字节当前可能还没接入计费. 网页端的 "使用量" 也一直都是 0, 现在应该还属于内测阶段.
+            print(f"~~>> 计量计费-UsageResponse: {response_data}")
+            # 计量计费相关字段
+            if hasattr(response_data, 'status_code'):
+                json_data["status_code"] = response_data.status_code
+            if hasattr(response_data, 'message'):
+                json_data["message"] = response_data.message
+            if hasattr(response_data, 'billing'):
+                billing_data = {}
+                if hasattr(response_data.billing, 'items'):
+                    billing_items = []
+                    for item in response_data.billing.items:
+                        item_data = {}
+                        if hasattr(item, 'unit'):
+                            item_data["unit"] = item.unit
+                        if hasattr(item, 'quantity'):
+                            item_data["quantity"] = item.quantity
+                        billing_items.append(item_data)
+                    billing_data["items"] = billing_items
+                if hasattr(response_data.billing, 'duration_msec'):
+                    billing_data["duration_msec"] = response_data.billing.duration_msec
+                json_data["billing"] = billing_data
         
         # 写入日志文件
         log_entry = f"{timestamp} ==>> {description}: {json.dumps(json_data, ensure_ascii=False)}\n"
