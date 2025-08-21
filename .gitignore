@@ -33,6 +33,7 @@ var/
 Thumbs.db
 
 logs/
+*.log
 *.txt
 !requirements.txt
 

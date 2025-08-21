@@ -7,6 +7,7 @@ import sys
 import time
 import logging
 import json
+import re
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Union
@@ -92,13 +93,46 @@ class YouTubeLiveStreamer:
         self.duration_seconds = duration_seconds
         self.yt_dlp_process = None
         self.ffmpeg_process = None
+        self.ffmpeg_console_file = None
         self.log_dir = Path(current_dir) / "youtube" / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create ffmpeg log directories
+        self.ffmpeg_report_dir = Path(current_dir) / "youtube" / "ffmpeg" / "report"
+        self.ffmpeg_log_dir = Path(current_dir) / "youtube" / "ffmpeg" / "log"
+        self.ffmpeg_report_dir.mkdir(parents=True, exist_ok=True)
+        self.ffmpeg_log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract YouTube video ID from URL
+        self.youtube_url_id = self._extract_youtube_id(youtube_url)
+    
+    def _extract_youtube_id(self, url: str) -> str:
+        """Extract YouTube video ID from various YouTube URL formats"""
+        patterns = [
+            r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)([^&\n?#]+)',
+            r'youtube\.com/live/([^&\n?#]+)',
+            r'youtube\.com/channel/([^&\n?#/]+)',
+            r'youtube\.com/c/([^&\n?#/]+)',
+            r'youtube\.com/@([^&\n?#/]+)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        
+        # If no pattern matches, use a hash of the URL as fallback
+        import hashlib
+        return hashlib.md5(url.encode()).hexdigest()[:8]
         
     async def start_streaming_pipeline(self):
         """Start yt-dlp (extract URL) + ffmpeg (direct network pull) pipeline for PCM streaming"""
         timestamp = time.strftime("%Y%m%dT%H%M%SZ")
         yt_dlp_log = self.log_dir / f"yt-dlp_{timestamp}.log"
+        
+        # Create ffmpeg log file paths
+        ffmpeg_report_log = self.ffmpeg_report_dir / f"ffmpeg-report-{timestamp}-{self.youtube_url_id}.log"
+        ffmpeg_console_log = self.ffmpeg_log_dir / f"ffmpeg-console-{timestamp}-{self.youtube_url_id}.log"
         
         # Step 1: Use yt-dlp to extract direct stream URL only
         yt_dlp_cmd = [
@@ -136,7 +170,18 @@ class YouTubeLiveStreamer:
             ffmpeg_cmd = [
                 "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg",  # ffmpeg 主程序
                 "-hide_banner",  # 隐藏 ffmpeg 启动横幅信息
-                "-loglevel", "error",  # 恢复详细日志以诊断问题
+                "-report",  # 它会生成一个详细的报告文件，完整记录 FFmpeg 的所有命令行输出（无论你在 -loglevel 设置了什么级别）、运行环境、库版本等信息。当你的 Python 脚本无法完全捕获实时输出时，这个报告文件就是你最终的真相来源。
+                "-loglevel", "verbose",  # 恢复详细日志以诊断问题
+
+                # --- ↓↓↓ 超低延迟优化参数 ↓↓↓ ---
+                "-fflags", "nobuffer",       # 告诉 demuxer 不要缓冲数据包
+                "-probesize", "32",           # 极大地减小探测数据大小，快速启动
+                "-analyzeduration", "0",      # 不花时间分析流的初始部分
+                "-avioflags", "direct",       # 减少 I/O 层的缓冲
+                "-flush_packets", "1",        # 每处理一个包就立刻刷新，而不是等待
+                # "-hls_live_edge", "99999",   # 设置 HLS 直播边缘时间，确保快速响应
+                # --- ↑↑↑ 超低延迟优化参数 ↑↑↑ ---
+
                 "-http_proxy", "http://127.0.0.1:7897",
                 "-i", direct_url,  # 输入源：直接从网络URL读取
                 "-ac", "1",  # 音频通道数：1（单声道）
@@ -151,13 +196,26 @@ class YouTubeLiveStreamer:
             # Start ffmpeg process directly with network stream
             logging.info("Starting ffmpeg with direct network stream...")
             logging.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+            logging.info(f"FFmpeg report log: {ffmpeg_report_log}")
+            logging.info(f"FFmpeg console log: {ffmpeg_console_log}")
+            
+            # Set up environment for ffmpeg report output
+            ffmpeg_env = os.environ.copy()
+            ffmpeg_env['FFREPORT'] = f"file={ffmpeg_report_log}:level=48"
+            
+            # Open console log file for stderr redirection
+            ffmpeg_console_file = open(ffmpeg_console_log, 'w')
             
             self.ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0
+                stderr=ffmpeg_console_file,
+                bufsize=0,
+                env=ffmpeg_env
             )
+            
+            # Store the file handle for cleanup
+            self.ffmpeg_console_file = ffmpeg_console_file
             
             # No need for yt-dlp process anymore
             self.yt_dlp_process = None
@@ -166,15 +224,25 @@ class YouTubeLiveStreamer:
             await asyncio.sleep(5.0)  # Give ffmpeg more time to initialize HLS stream
             if self.ffmpeg_process.poll() is not None:
                 # ffmpeg process has already exited
-                stderr_output = self.ffmpeg_process.stderr.read().decode('utf-8', errors='ignore')
                 logging.error(f"FFmpeg process exited early with code: {self.ffmpeg_process.returncode}")
-                logging.error(f"FFmpeg stderr: {stderr_output}")
-                raise Exception(f"FFmpeg failed to start: {stderr_output}")
+                logging.error(f"FFmpeg console log: {ffmpeg_console_log}")
+                # Try to read the console log file for error details
+                try:
+                    with open(ffmpeg_console_log, 'r') as f:
+                        stderr_content = f.read()
+                        if stderr_content.strip():
+                            logging.error(f"FFmpeg stderr from log file: {stderr_content}")
+                except Exception as e:
+                    logging.error(f"Could not read ffmpeg console log: {e}")
+                raise Exception(f"FFmpeg failed to start, check log file: {ffmpeg_console_log}")
             
             logging.info(f"FFmpeg process started successfully (PID: {self.ffmpeg_process.pid})")
             
-            # Start a background task to monitor ffmpeg stderr
-            asyncio.create_task(self._monitor_ffmpeg_stderr())
+            # Start a background task to monitor ffmpeg console log
+            stderr_monitor_task = asyncio.create_task(self._monitor_ffmpeg_stderr(ffmpeg_console_log))
+            
+            # Start a background task to monitor ffmpeg health
+            health_monitor_task = asyncio.create_task(self._monitor_ffmpeg_health())
             
             logging.info(f"Started direct network streaming pipeline, yt-dlp logs: {yt_dlp_log}")
             return self.ffmpeg_process.stdout
@@ -184,31 +252,129 @@ class YouTubeLiveStreamer:
             await self.cleanup()
             raise
     
-    async def _monitor_ffmpeg_stderr(self):
-        """Monitor ffmpeg stderr output in the background"""
-        if not self.ffmpeg_process or not self.ffmpeg_process.stderr:
+    async def _monitor_ffmpeg_stderr(self, console_log_path):
+        """Monitor ffmpeg console log file in the background"""
+        if not self.ffmpeg_process:
+            logging.warning("🔧 FFmpeg stderr monitor: No process available")
             return
             
+        logging.info(f"🔧 Starting FFmpeg console log monitor for PID {self.ffmpeg_process.pid}")
+        logging.info(f"🔧 Monitoring log file: {console_log_path}")
+        
+        try:
+            line_count = 0
+            last_position = 0
+            
+            while self.ffmpeg_process.poll() is None:
+                try:
+                    # Check if log file exists and read new lines
+                    if os.path.exists(console_log_path):
+                        with open(console_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            f.seek(last_position)
+                            new_lines = f.readlines()
+                            last_position = f.tell()
+                            
+                            for line in new_lines:
+                                line_str = line.strip()
+                                if line_str:
+                                    line_count += 1
+                                    # Categorize different types of FFmpeg messages
+                                    if "error" in line_str.lower() or "failed" in line_str.lower():
+                                        logging.error(f"🔴 FFmpeg ERROR: {line_str}")
+                                    elif "warning" in line_str.lower():
+                                        logging.warning(f"🟡 FFmpeg WARNING: {line_str}")
+                                    elif "connection" in line_str.lower() or "http" in line_str.lower():
+                                        logging.info(f"🌐 FFmpeg NETWORK: {line_str}")
+                                    elif any(keyword in line_str.lower() for keyword in ["duration", "time=", "bitrate", "fps"]):
+                                        logging.debug(f"📊 FFmpeg PROGRESS: {line_str}")
+                                    else:
+                                        logging.info(f"🔧 FFmpeg: {line_str}")
+                    
+                    # Wait a bit before checking again
+                    await asyncio.sleep(1.0)
+                    
+                except Exception as e:
+                    logging.error(f"🔧 Error reading ffmpeg console log: {e}")
+                    await asyncio.sleep(2.0)  # Wait longer on error
+            
+            # Process has exited, read any remaining log content
+            final_exit_code = self.ffmpeg_process.returncode
+            logging.info(f"🔧 FFmpeg process exited with code: {final_exit_code}, total log lines processed: {line_count}")
+            
+            # Read any final content from the log file
+            try:
+                if os.path.exists(console_log_path):
+                    with open(console_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        f.seek(last_position)
+                        remaining_content = f.read()
+                        if remaining_content.strip():
+                            logging.info(f"🔧 Final FFmpeg log content: {remaining_content}")
+            except Exception as e:
+                logging.error(f"🔧 Error reading final log content: {e}")
+                
+        except Exception as e:
+            logging.error(f"🔧 FFmpeg console log monitor error: {e}")
+            import traceback
+            logging.error(f"🔧 Monitor traceback: {traceback.format_exc()}")
+        
+        logging.info("🔧 FFmpeg console log monitor ended")
+    
+    async def _monitor_ffmpeg_health(self):
+        """Monitor FFmpeg process health and network connectivity"""
+        if not self.ffmpeg_process:
+            logging.warning("💓 FFmpeg health monitor: No process available")
+            return
+            
+        logging.info(f"💓 Starting FFmpeg health monitor for PID {self.ffmpeg_process.pid}")
+        logging.info(f"💓 FFmpeg duration limit: {self.duration_seconds} seconds")
+        check_count = 0
+        start_time = time.time()
+        
         try:
             while self.ffmpeg_process.poll() is None:
-                # Read stderr with timeout
+                await asyncio.sleep(30)  # Check every 30 seconds
+                check_count += 1
+                
+                # Log process health status
                 try:
-                    loop = asyncio.get_event_loop()
-                    line = await asyncio.wait_for(
-                        loop.run_in_executor(None, self.ffmpeg_process.stderr.readline),
-                        timeout=1.0
-                    )
-                    if line:
-                        line_str = line.decode('utf-8', errors='ignore').strip()
-                        if line_str:
-                            logging.info(f"FFmpeg: {line_str}")
-                except asyncio.TimeoutError:
-                    continue
+                    import psutil
+                    process = psutil.Process(self.ffmpeg_process.pid)
+                    cpu_percent = process.cpu_percent()
+                    memory_info = process.memory_info()
+                    logging.info(f"💓 FFmpeg health check #{check_count}: CPU {cpu_percent:.1f}%, Memory {memory_info.rss/1024/1024:.1f}MB")
+                except ImportError:
+                    logging.info(f"💓 FFmpeg health check #{check_count}: Process alive (psutil not available for detailed stats)")
                 except Exception as e:
-                    logging.error(f"Error reading ffmpeg stderr: {e}")
-                    break
+                    logging.warning(f"💓 FFmpeg health check #{check_count}: Error getting process stats: {e}")
+            
+            # Process has exited
+            exit_code = self.ffmpeg_process.returncode
+            elapsed_time = time.time() - start_time
+            logging.info(f"💓 FFmpeg health monitor: Process exited with code {exit_code} after {check_count} health checks")
+            logging.info(f"💓 Total runtime: {elapsed_time:.1f}s (limit was {self.duration_seconds}s)")
+            
+            # Check if FFmpeg reached its duration limit
+            if abs(elapsed_time - self.duration_seconds) < 5.0:  # Within 5 seconds of limit
+                logging.info(f"💓 FFmpeg likely exited due to reaching duration limit ({self.duration_seconds}s)")
+            
+            # Provide interpretation of common exit codes
+            if exit_code == 0:
+                logging.info("💓 Exit code 0: Normal termination")
+            elif exit_code == 1:
+                logging.warning("💓 Exit code 1: Generic error (check FFmpeg stderr for details)")
+            elif exit_code == -9:
+                logging.error("💓 Exit code -9: Process was killed (SIGKILL)")
+            elif exit_code == -15:
+                logging.warning("💓 Exit code -15: Process was terminated (SIGTERM)")
+            else:
+                logging.warning(f"💓 Exit code {exit_code}: Check FFmpeg documentation for details")
+                
         except Exception as e:
-            logging.error(f"FFmpeg stderr monitor error: {e}")
+            logging.error(f"💓 FFmpeg health monitor error: {e}")
+            import traceback
+            logging.error(f"💓 Health monitor traceback: {traceback.format_exc()}")
+        
+        logging.info("💓 FFmpeg health monitor ended")
             
     async def cleanup(self):
         """Clean up subprocess resources"""
@@ -220,6 +386,13 @@ class YouTubeLiveStreamer:
                 self.ffmpeg_process.kill()
             except Exception as e:
                 logging.error(f"Error terminating ffmpeg: {e}")
+        
+        # Close ffmpeg console log file if it exists
+        if hasattr(self, 'ffmpeg_console_file') and self.ffmpeg_console_file:
+            try:
+                self.ffmpeg_console_file.close()
+            except Exception as e:
+                logging.error(f"Error closing ffmpeg console log file: {e}")
         
         if self.yt_dlp_process:
             try:
@@ -356,7 +529,7 @@ async def build_http_headers(conf: Config, conn_id: str) -> Headers:
     })
     return headers
 
-async def read_pcm_chunks(pcm_stream, chunk_size: int = 640):
+async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None):
     """Read PCM data in chunks (640 bytes = 20ms at 16kHz mono s16le)"""
     import asyncio
     loop = asyncio.get_event_loop()
@@ -366,6 +539,14 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640):
     
     while True:
         try:
+            # Check FFmpeg process health before reading
+            if ffmpeg_process and ffmpeg_process.poll() is not None:
+                # FFmpeg process has terminated
+                logging.error(f"🚫 FFmpeg process terminated during chunk {chunk_count + 1} read")
+                logging.error(f"🚫 FFmpeg exit code: {ffmpeg_process.returncode}")
+                logging.error(f"🚫 Check FFmpeg console log file for error details")
+                break
+            
             # Use run_in_executor to make blocking read non-blocking with timeout
             logging.debug(f"Attempting to read PCM chunk {chunk_count + 1}...")
             
@@ -378,14 +559,30 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640):
                     timeout=timeout_duration
                 )
             except asyncio.TimeoutError:
-                if chunk_count == 0:
-                    logging.error("Timeout waiting for first PCM chunk - ffmpeg may be stuck or stream unavailable")
+                # Check FFmpeg process status on timeout
+                if ffmpeg_process:
+                    if ffmpeg_process.poll() is not None:
+                        logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: FFmpeg process exited (code: {ffmpeg_process.returncode})")
+                        logging.error(f"⏰ Check FFmpeg console log file for error details")
+                    else:
+                        logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: FFmpeg still running (PID: {ffmpeg_process.pid})")
+                        logging.error(f"⏰ This suggests the stream ended or FFmpeg is blocked")
                 else:
-                    logging.error(f"Timeout reading PCM chunk {chunk_count + 1} - stream may have ended")
+                    logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: No FFmpeg process reference")
+                
+                if chunk_count == 0:
+                    logging.error("🔴 Timeout waiting for first PCM chunk - ffmpeg may be stuck or stream unavailable")
+                else:
+                    logging.error(f"🔴 Timeout reading PCM chunk {chunk_count + 1} - stream may have ended")
                 break
             
             if not chunk:
-                logging.info(f"PCM stream ended after {chunk_count} chunks")
+                logging.info(f"📄 PCM stream ended naturally after {chunk_count} chunks")
+                # Check if FFmpeg is still running when stream ends
+                if ffmpeg_process and ffmpeg_process.poll() is None:
+                    logging.info(f"✅ FFmpeg still running (PID: {ffmpeg_process.pid}) when stream ended")
+                elif ffmpeg_process:
+                    logging.info(f"⚠️ FFmpeg exited (code: {ffmpeg_process.returncode}) when stream ended")
                 break
                 
             chunk_count += 1
@@ -393,18 +590,34 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640):
                 logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes")
             elif chunk_count % 50 == 0:
                 logging.info(f"Successfully read PCM chunk {chunk_count}: {len(chunk)} bytes")
+                # Periodic FFmpeg health check
+                if ffmpeg_process and ffmpeg_process.poll() is not None:
+                    logging.warning(f"⚠️ FFmpeg process died during streaming at chunk {chunk_count}")
             else:
                 logging.debug(f"Successfully read PCM chunk {chunk_count}: {len(chunk)} bytes")
             
             yield chunk
             
         except Exception as e:
-            logging.error(f"Error reading PCM chunk {chunk_count}: {e}")
+            logging.error(f"❌ Error reading PCM chunk {chunk_count}: {e}")
             import traceback
-            logging.error(f"PCM read traceback: {traceback.format_exc()}")
+            logging.error(f"❌ PCM read traceback: {traceback.format_exc()}")
+            
+            # Check FFmpeg status on error
+            if ffmpeg_process:
+                if ffmpeg_process.poll() is not None:
+                    logging.error(f"❌ FFmpeg process status on error: exited with code {ffmpeg_process.returncode}")
+                    logging.error(f"❌ Check FFmpeg console log file for error details")
+                else:
+                    logging.error(f"❌ FFmpeg process status on error: still running (PID: {ffmpeg_process.pid})")
             break
     
-    logging.info(f"PCM chunk reading completed, total chunks: {chunk_count}")
+    logging.info(f"📊 PCM chunk reading completed, total chunks: {chunk_count}")
+    if ffmpeg_process:
+        if ffmpeg_process.poll() is not None:
+            logging.info(f"📊 Final FFmpeg status: exited with code {ffmpeg_process.returncode}")
+        else:
+            logging.info(f"📊 Final FFmpeg status: still running (PID: {ffmpeg_process.pid})")
 
 async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None):
     """Generator function that yields translated audio chunks from YouTube live stream"""
@@ -464,13 +677,12 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                 
                 # Check if ffmpeg process is still running
                 if streamer.ffmpeg_process.poll() is not None:
-                    stderr_output = streamer.ffmpeg_process.stderr.read().decode('utf-8', errors='ignore')
                     logging.error(f"FFmpeg process has exited with code: {streamer.ffmpeg_process.returncode}")
-                    logging.error(f"FFmpeg stderr: {stderr_output}")
+                    logging.error(f"Check FFmpeg console log file for error details")
                     finished.set()
                     return
                 
-                async for chunk in read_pcm_chunks(pcm_stream):
+                async for chunk in read_pcm_chunks(pcm_stream, ffmpeg_process=streamer.ffmpeg_process):
                     if not chunk:
                         logging.info("No more PCM chunks available")
                         break
@@ -622,7 +834,7 @@ async def translate_youtube_live(conf: Config, youtube_url: str, duration_second
             nonlocal chunk_count
             try:
                 logging.info("Starting to read PCM chunks from ffmpeg...")
-                async for chunk in read_pcm_chunks(pcm_stream):
+                async for chunk in read_pcm_chunks(pcm_stream, ffmpeg_process=streamer.ffmpeg_process):
                     if not chunk:
                         logging.info("No more PCM chunks available")
                         break
