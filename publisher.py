@@ -19,7 +19,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 # Import modified youtube demo functions
-from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream
+from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -199,26 +199,32 @@ class AudioStreamPublisher:
                 self.sessions[session.session_id].status = "completed"
     
     async def _stream_translated_audio(self, config: Config, session: PublisherSession, ws_client):
-        """Stream translated PCM audio directly to WebSocket publisher"""
+        """Stream translated PCM audio and subtitles to WebSocket publisher"""
         try:
-            async for pcm_audio_chunk in translate_youtube_live_stream(config, session.youtube_url):
+            async for stream_data in translate_youtube_live_stream(config, session.youtube_url):
                 # Check if stop was requested
                 if session.stop_event and session.stop_event.is_set():
-                    self.logger.info(f"Session {session.session_id}: Stop requested, terminating audio stream")
+                    self.logger.info(f"Session {session.session_id}: Stop requested, terminating stream")
                     break
                 
-                if not pcm_audio_chunk:
+                if not stream_data:
                     break
                 
-                # Directly forward PCM audio chunks without any processing
-                # The audio is already in PCM format from the translation service
-                await ws_client.send_audio_frame(pcm_audio_chunk)
+                # Handle different types of stream data
+                if stream_data.data_type == "audio":
+                    # Directly forward PCM audio chunks without any processing
+                    # The audio is already in PCM format from the translation service
+                    await ws_client.send_audio_frame(stream_data.content)
+                elif stream_data.data_type == "subtitle":
+                    # Send subtitle JSON as text message
+                    await ws_client.send_text_message(stream_data.content)
+                    self.logger.debug(f"Session {session.session_id}: Sent subtitle: {stream_data.content}")
                 
         except asyncio.CancelledError:
-            self.logger.info(f"Session {session.session_id}: Audio streaming cancelled")
+            self.logger.info(f"Session {session.session_id}: Streaming cancelled")
             raise
         except Exception as e:
-            self.logger.error(f"Session {session.session_id}: Audio streaming error: {e}")
+            self.logger.error(f"Session {session.session_id}: Streaming error: {e}")
             raise
         finally:
             await ws_client.disconnect()
@@ -318,6 +324,22 @@ class WebSocketPublishClient:
             # Retry sending the chunk
             await self.websocket.send(audio_chunk)
             self.frame_count += 1
+    
+    async def send_text_message(self, text_message: str):
+        """Send text message (JSON subtitle) with automatic reconnection"""
+        if not self.websocket:
+            self.logger.warning(f"Session {self.session_id}: Connection lost, attempting to reconnect...")
+            await self.connect()
+        
+        try:
+            await self.websocket.send(text_message)
+            self.logger.debug(f"Session {self.session_id}: Sent text message: {text_message}")
+                
+        except (ConnectionClosed, WebSocketException) as e:
+            self.logger.warning(f"Session {self.session_id}: Send text failed, reconnecting: {e}")
+            await self.connect()
+            # Retry sending the message
+            await self.websocket.send(text_message)
     
     async def disconnect(self):
         """Gracefully disconnect"""

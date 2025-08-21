@@ -6,9 +6,10 @@ import signal
 import sys
 import time
 import logging
+import json
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Union
 import websockets
 from websockets import Headers
 from dotenv import load_dotenv
@@ -67,6 +68,23 @@ class TranslateResponseData:
     text: str
     data: bytes
     message: str = None
+    start_time: Optional[int] = None
+    end_time: Optional[int] = None
+
+@dataclass
+class SubtitleMessage:
+    type: str = "subtitle"
+    lane: str = None  # "source" or "translation"
+    phase: str = None  # "start", "delta", or "end"
+    text: str = None
+    start_time: Optional[int] = None
+    end_time: Optional[int] = None
+    final: bool = False
+
+@dataclass
+class StreamData:
+    data_type: str  # "audio" or "subtitle"
+    content: Union[bytes, str]  # binary audio data or JSON string
 
 class YouTubeLiveStreamer:
     def __init__(self, youtube_url: str, duration_seconds: int = 10):
@@ -250,8 +268,83 @@ async def receive_message(ws) -> TranslateResponseData:
         sequence=Response_data.response_meta.Sequence,
         text=Response_data.text,
         data=Response_data.data,
-        message=Response_data.response_meta.Message
+        message=Response_data.response_meta.Message,
+        start_time=Response_data.start_time if hasattr(Response_data, 'start_time') else None,
+        end_time=Response_data.end_time if hasattr(Response_data, 'end_time') else None
     )
+
+def map_event_to_subtitle_json(resp: TranslateResponseData) -> Optional[str]:
+    """Map WebSocket events (650-655) to unified JSON format"""
+    subtitle_msg = None
+    
+    # Source subtitle events (650-652)
+    if resp.event == Type.SourceSubtitleStart:
+        subtitle_msg = SubtitleMessage(
+            lane="source",
+            phase="start",
+            start_time=resp.start_time,
+            final=False
+        )
+    elif resp.event == Type.SourceSubtitleResponse:
+        subtitle_msg = SubtitleMessage(
+            lane="source", 
+            phase="delta",
+            text=resp.text,
+            final=False
+        )
+    elif resp.event == Type.SourceSubtitleEnd:
+        subtitle_msg = SubtitleMessage(
+            lane="source",
+            phase="end", 
+            text=resp.text,
+            start_time=resp.start_time,
+            end_time=resp.end_time,
+            final=True
+        )
+    # Translation subtitle events (653-655)
+    elif resp.event == Type.TranslationSubtitleStart:
+        subtitle_msg = SubtitleMessage(
+            lane="translation",
+            phase="start",
+            start_time=resp.start_time,
+            final=False
+        )
+    elif resp.event == Type.TranslationSubtitleResponse:
+        subtitle_msg = SubtitleMessage(
+            lane="translation",
+            phase="delta",
+            text=resp.text,
+            final=False
+        )
+    elif resp.event == Type.TranslationSubtitleEnd:
+        subtitle_msg = SubtitleMessage(
+            lane="translation",
+            phase="end",
+            text=resp.text,
+            start_time=resp.start_time,
+            end_time=resp.end_time,
+            final=True
+        )
+    
+    if subtitle_msg:
+        # Convert to JSON, filtering out None values
+        subtitle_dict = {
+            "type": subtitle_msg.type,
+            "lane": subtitle_msg.lane,
+            "phase": subtitle_msg.phase,
+            "final": subtitle_msg.final
+        }
+        
+        if subtitle_msg.text is not None:
+            subtitle_dict["text"] = subtitle_msg.text
+        if subtitle_msg.start_time is not None:
+            subtitle_dict["start_time"] = subtitle_msg.start_time
+        if subtitle_msg.end_time is not None:
+            subtitle_dict["end_time"] = subtitle_msg.end_time
+            
+        return json.dumps(subtitle_dict, ensure_ascii=False)
+    
+    return None
 
 async def build_http_headers(conf: Config, conn_id: str) -> Headers:
     """Build WebSocket connection headers from config"""
@@ -360,7 +453,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         logging.info(f"Translation session (ID={session_id}) started.")
         
         # Create queues for communication between sender and receiver
-        audio_queue = asyncio.Queue()
+        stream_queue = asyncio.Queue()  # Queue for both audio and subtitle data
         finished = asyncio.Event()
         
         async def send_pcm_chunks():
@@ -436,9 +529,15 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                         finished.set()
                         break
                     
-                    # Yield translated audio data
+                    # Handle subtitle events (650-655)
+                    subtitle_json = map_event_to_subtitle_json(resp)
+                    if subtitle_json:
+                        await stream_queue.put(StreamData(data_type="subtitle", content=subtitle_json))
+                        logging.debug(f"Queued subtitle: {subtitle_json}")
+                    
+                    # Handle TTS audio data
                     if resp.data:
-                        await audio_queue.put(resp.data)
+                        await stream_queue.put(StreamData(data_type="audio", content=resp.data))
                         
             except Exception as e:
                 logging.error(f"Receive message error: {e}")
@@ -448,13 +547,13 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         sender_task = asyncio.create_task(send_pcm_chunks())
         receiver_task = asyncio.create_task(receive_responses())
         
-        # Yield audio chunks as they arrive
+        # Yield stream data (audio and subtitles) as they arrive
         try:
             while not finished.is_set():
                 try:
-                    # Wait for audio chunk with timeout
-                    audio_chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
-                    yield audio_chunk
+                    # Wait for stream data with timeout
+                    stream_data = await asyncio.wait_for(stream_queue.get(), timeout=1.0)
+                    yield stream_data
                 except asyncio.TimeoutError:
                     continue
         finally:
