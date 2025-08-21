@@ -87,6 +87,160 @@ class StreamData:
     data_type: str  # "audio" or "subtitle"
     content: Union[bytes, str]  # binary audio data or JSON string
 
+class ASTEventLogger:
+    """事件日志记录器，用于记录同声传译的事件消息"""
+    
+    def __init__(self, youtube_url: str):
+        self.youtube_url = youtube_url
+        self.youtube_id = self._extract_youtube_id(youtube_url)
+        
+        # 创建日志文件
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"ast_{timestamp}_{self.youtube_id}.txt"
+        
+        # 确保目录存在
+        self.log_dir = Path(current_dir) / "youtube" / "ast_event"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.log_file = self.log_dir / filename
+        
+        # 事件类型映射
+        self.event_descriptions = {
+            # 发送端事件
+            Type.StartSession: "建联请求-StartSession-100",
+            Type.UpdateConfig: "更新参数-UpdateConfig-201", 
+            Type.TaskRequest: "发送音频数据-TaskRequest-200",
+            Type.FinishSession: "结束session-FinishSession-102",
+            
+            # 接收端事件
+            Type.SessionStarted: "建联成功-SessionStarted-150",
+            Type.SourceSubtitleStart: "原文开始-SourceSubtitleStart-650",
+            Type.SourceSubtitleEnd: "原文结束-SourceSubtitleEnd-652",
+            Type.TranslationSubtitleStart: "译文开始-TranslationSubtitleStart-653", 
+            Type.TranslationSubtitleEnd: "译文结束-TranslationSubtitleEnd-655",
+            Type.TTSSentenceStart: "TTS开始-TTSSentenceStart-350",
+            Type.TTSSentenceEnd: "TTS结束-TTSSentenceEnd-351",
+            Type.UsageResponse: "计量计费-UsageResponse-154",
+            Type.SessionFinished: "会话正常结束-SessionFinished-152",
+            Type.SessionFailed: "会话失败-SessionFailed-153",
+            Type.AudioMuted: "静音事件-AudioMuted-250"
+        }
+        
+        logging.info(f"AST事件日志文件创建: {self.log_file}")
+    
+    def _extract_youtube_id(self, url: str) -> str:
+        """从YouTube URL中提取视频ID"""
+        patterns = [
+            r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)([^&\n?#]+)',
+            r'youtube\.com/live/([^&\n?#]+)',
+            r'youtube\.com/channel/([^&\n?#/]+)',
+            r'youtube\.com/c/([^&\n?#/]+)',
+            r'youtube\.com/@([^&\n?#/]+)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        
+        # 如果没有匹配到，使用URL的哈希值作为后备
+        import hashlib
+        return hashlib.md5(url.encode()).hexdigest()[:8]
+    
+    def log_send_event(self, event_type: Type, request_data: TranslateRequestData):
+        """记录发送端事件"""
+        if event_type not in self.event_descriptions:
+            return
+            
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S,") + str(int(time.time() * 1000) % 1000).zfill(3)
+        description = self.event_descriptions[event_type]
+        
+        # 构建JSON数据
+        event_name = f"Type_{event_type.name}" if hasattr(event_type, 'name') else f"event.Type_{event_type}"
+        json_data = {
+            "event": event_name,
+            "session_id": request_data.session_id
+        }
+        
+        # 根据事件类型添加特定字段
+        if event_type == Type.StartSession:
+            if request_data.source_audio:
+                json_data["source_audio"] = {
+                    "format": request_data.source_audio.format,
+                    "rate": request_data.source_audio.rate,
+                    "bits": request_data.source_audio.bits,
+                    "channel": request_data.source_audio.channel
+                }
+            if request_data.target_audio:
+                json_data["target_audio"] = {
+                    "format": request_data.target_audio.format,
+                    "rate": request_data.target_audio.rate
+                }
+            if request_data.mode:
+                json_data["mode"] = request_data.mode
+            if request_data.source_language:
+                json_data["source_language"] = request_data.source_language
+            if request_data.target_language:
+                json_data["target_language"] = request_data.target_language
+                
+        elif event_type == Type.TaskRequest:
+            if request_data.source_audio and request_data.source_audio.binary_data:
+                json_data["source_audio"] = {
+                    "data": "二进制数据"
+                }
+        
+        # 写入日志文件
+        log_entry = f"{timestamp} ==>> {description}: {json.dumps(json_data, ensure_ascii=False)}\n"
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
+    
+    def log_receive_event(self, response_data: TranslateResponseData):
+        """记录接收端事件"""
+        event_type = response_data.event
+        if event_type not in self.event_descriptions:
+            return
+            
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S,") + str(int(time.time() * 1000) % 1000).zfill(3)
+        description = self.event_descriptions[event_type]
+        
+        # 构建JSON数据
+        event_name = f"Type_{event_type.name}" if hasattr(event_type, 'name') else f"event.Type_{event_type}"
+        json_data = {
+            "event": event_name,
+            "session_id": response_data.session_id
+        }
+        
+        # 根据事件类型添加特定字段
+        if event_type in [Type.SourceSubtitleStart, Type.TranslationSubtitleStart, Type.TTSSentenceStart]:
+            if response_data.start_time is not None:
+                json_data["start_time"] = response_data.start_time
+                
+        elif event_type in [Type.SourceSubtitleEnd, Type.TranslationSubtitleEnd]:
+            if response_data.start_time is not None:
+                json_data["start_time"] = response_data.start_time
+            if response_data.end_time is not None:
+                json_data["end_time"] = response_data.end_time
+            if response_data.text:
+                json_data["text"] = response_data.text
+                
+        elif event_type == Type.TTSSentenceEnd:
+            if response_data.data:
+                json_data["data"] = "二进制数据"
+            if response_data.start_time is not None:
+                json_data["start_time"] = response_data.start_time
+            if response_data.end_time is not None:
+                json_data["end_time"] = response_data.end_time
+                
+        elif event_type == Type.AudioMuted:
+            # 从message中提取静音时长（如果有的话）
+            if response_data.message:
+                json_data["message"] = response_data.message
+        
+        # 写入日志文件
+        log_entry = f"{timestamp} ==>> {description}: {json.dumps(json_data, ensure_ascii=False)}\n"
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(log_entry)
+
 class YouTubeLiveStreamer:
     def __init__(self, youtube_url: str, duration_seconds: int = 10):
         self.youtube_url = youtube_url
@@ -623,6 +777,9 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
     """Generator function that yields translated audio chunks from YouTube live stream"""
     streamer = YouTubeLiveStreamer(youtube_url, duration_seconds or 3600)  # Default 1 hour
     
+    # 初始化事件日志记录器
+    event_logger = ASTEventLogger(youtube_url)
+    
     try:
         # Start streaming pipeline
         pcm_stream = await streamer.start_streaming_pipeline()
@@ -654,8 +811,16 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             target_language="en"
         )
         
+        # 记录发送StartSession事件
+        event_logger.log_send_event(Type.StartSession, start_request)
+        
         await send_request(conn, start_request)
         resp = await receive_message(conn)
+        
+        # 记录接收到的SessionStarted事件
+        if resp.event == Type.SessionStarted:
+            event_logger.log_receive_event(resp)
+        
         if resp.event != Type.SessionStarted:
             logging.error(f"Unexpected response logid: {log_id}")
             logging.error(f"Unexpected response: {resp.event}")
@@ -701,6 +866,11 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                         event="Type_TaskRequest",
                         source_audio=Audio(binary_data=chunk)
                     )
+                    
+                    # 记录TaskRequest事件（只记录第一个和每50个chunk以避免日志过多）
+                    if chunk_count == 1 or chunk_count % 50 == 0:
+                        event_logger.log_send_event(Type.TaskRequest, chunk_request)
+                    
                     await send_request(conn, chunk_request)
                     await asyncio.sleep(0.02)  # 20ms delay to match chunk rate
                 
@@ -712,6 +882,10 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     event="Type_FinishSession",
                     source_audio=Audio()
                 )
+                
+                # 记录发送FinishSession事件
+                event_logger.log_send_event(Type.FinishSession, finish_request)
+                
                 await send_request(conn, finish_request)
                 logging.info("FinishSession request sent.")
                 
@@ -725,6 +899,9 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             try:
                 while not finished.is_set():
                     resp = await receive_message(conn)
+                    
+                    # 记录接收到的事件
+                    event_logger.log_receive_event(resp)
                     
                     logging.debug(
                         f"Received message (event={resp.event}, session_id={resp.session_id}): "
