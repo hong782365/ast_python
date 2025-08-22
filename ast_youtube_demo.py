@@ -9,7 +9,7 @@ import logging
 import json
 import re
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Union
 import websockets
 from websockets import Headers
@@ -76,6 +76,19 @@ class TranslateResponseData:
     message: str = None
     start_time: Optional[int] = None
     end_time: Optional[int] = None
+    status_code: Optional[int] = None
+    billing: Optional["BillingData"] = None
+
+@dataclass
+class BillingItemData:
+    unit: Optional[str] = None
+    quantity: Optional[float] = None
+
+@dataclass
+class BillingData:
+    items: List[BillingItemData] = field(default_factory=list)
+    duration_msec: Optional[int] = None
+    word_count: Optional[int] = None
 
 @dataclass
 class SubtitleMessage:
@@ -242,30 +255,25 @@ class ASTEventLogger:
                 json_data["message"] = response_data.message
                 
         elif event_type == Type.UsageResponse:
-            # ~~>> 计量计费-UsageResponse: TranslateResponseData(event=154, session_id='f3edfd77-e77f-4af3-aa6d-5bf3472fae83', sequence=0, text='', data=b'', message='OK', start_time=0, end_time=0)
-            # 打印的数据里根本没有费用相关的字段, 和文档里的返回结构不一致. 
-            # 说明字节当前可能还没接入计费. 网页端的 "使用量" 也一直都是 0, 现在应该还属于内测阶段.
-            print(f"~~>> 计量计费-UsageResponse: {response_data}")
-            # 计量计费相关字段
-            if hasattr(response_data, 'status_code'):
+            # 计量计费
+            if response_data.status_code is not None:
                 json_data["status_code"] = response_data.status_code
-            if hasattr(response_data, 'message'):
+            if response_data.message:
                 json_data["message"] = response_data.message
-            if hasattr(response_data, 'billing'):
+            if response_data.billing is not None:
                 billing_data = {}
-                if hasattr(response_data.billing, 'items'):
-                    billing_items = []
-                    for item in response_data.billing.items:
-                        item_data = {}
-                        if hasattr(item, 'unit'):
-                            item_data["unit"] = item.unit
-                        if hasattr(item, 'quantity'):
-                            item_data["quantity"] = item.quantity
-                        billing_items.append(item_data)
-                    billing_data["items"] = billing_items
-                if hasattr(response_data.billing, 'duration_msec'):
+                if response_data.billing.items:
+                    billing_data["items"] = [
+                        {"unit": item.unit, "quantity": item.quantity}
+                        for item in response_data.billing.items
+                        if item.unit is not None or item.quantity is not None
+                    ]
+                if response_data.billing.duration_msec is not None:
                     billing_data["duration_msec"] = response_data.billing.duration_msec
-                json_data["billing"] = billing_data
+                if response_data.billing.word_count is not None:
+                    billing_data["word_count"] = response_data.billing.word_count
+                if billing_data:
+                    json_data["billing"] = billing_data
         
         # 写入日志文件
         log_entry = f"{timestamp} ==>> {description}: {json.dumps(json_data, ensure_ascii=False)}\n"
@@ -772,6 +780,36 @@ async def receive_message(ws) -> TranslateResponseData:
     response = await ws.recv()
     Response_data = TranslateResponse()
     Response_data.ParseFromString(response)
+    # Parse billing information if present
+    status_code_value: Optional[int] = None
+    billing_value: Optional[BillingData] = None
+    try:
+        status_code_value = Response_data.response_meta.StatusCode
+    except Exception:
+        status_code_value = None
+    try:
+        meta_billing = Response_data.response_meta.Billing
+        # Build BillingData regardless; it will be empty if not set
+        items_list: List[BillingItemData] = []
+        try:
+            for item in getattr(meta_billing, 'Items', []):
+                items_list.append(BillingItemData(
+                    unit=getattr(item, 'Unit', None),
+                    quantity=getattr(item, 'Quantity', None)
+                ))
+        except Exception:
+            items_list = []
+        billing_value = BillingData(
+            items=items_list,
+            duration_msec=getattr(meta_billing, 'DurationMsec', None),
+            word_count=getattr(meta_billing, 'WordCount', None)
+        )
+        # If nothing meaningful was set, keep it as None
+        if not billing_value.items and billing_value.duration_msec in (None, 0) and billing_value.word_count in (None, 0):
+            billing_value = None
+    except Exception:
+        billing_value = None
+
     return TranslateResponseData(
         event=Response_data.event,
         session_id=Response_data.response_meta.SessionID,
@@ -780,7 +818,9 @@ async def receive_message(ws) -> TranslateResponseData:
         data=Response_data.data,
         message=Response_data.response_meta.Message,
         start_time=Response_data.start_time if hasattr(Response_data, 'start_time') else None,
-        end_time=Response_data.end_time if hasattr(Response_data, 'end_time') else None
+        end_time=Response_data.end_time if hasattr(Response_data, 'end_time') else None,
+        status_code=status_code_value,
+        billing=billing_value
     )
 
 async def send_silence_until_ready(conn, session_id, audio_ready_event, timeout_seconds=8):
