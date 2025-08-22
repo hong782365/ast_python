@@ -511,7 +511,7 @@ class YouTubeLiveStreamer:
                 "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg",  # ffmpeg 主程序
                 "-hide_banner",  # 隐藏 ffmpeg 启动横幅信息
                 "-report",  # 它会生成一个详细的报告文件，完整记录 FFmpeg 的所有命令行输出（无论你在 -loglevel 设置了什么级别）、运行环境、库版本等信息。当你的 Python 脚本无法完全捕获实时输出时，这个报告文件就是你最终的真相来源。
-                "-loglevel", "verbose",  # 恢复详细日志以诊断问题
+                "-loglevel", "error",  # verbose 恢复详细日志以诊断问题
 
                 # --- ↓↓↓ 超低延迟优化参数 ↓↓↓ ---
                 "-fflags", "nobuffer",       # 告诉 demuxer 不要缓冲数据包
@@ -561,8 +561,11 @@ class YouTubeLiveStreamer:
             # No need for yt-dlp process anymore
             self.yt_dlp_process = None
             
-            # Wait longer for ffmpeg to initialize and start processing HLS stream
-            await asyncio.sleep(5.0)  # Give ffmpeg more time to initialize HLS stream
+            # Store the spawn timestamp for later timing calculation
+            self.ffmpeg_spawn_time = time.monotonic()
+            
+            # Basic process health check (don't wait for stream readiness)
+            await asyncio.sleep(0.1)  # Very short wait just to detect immediate failures
             if self.ffmpeg_process.poll() is not None:
                 # ffmpeg process has already exited
                 logging.error(f"FFmpeg process exited early with code: {self.ffmpeg_process.returncode}")
@@ -577,8 +580,7 @@ class YouTubeLiveStreamer:
                     logging.error(f"Could not read ffmpeg console log: {e}")
                 raise Exception(f"FFmpeg failed to start, check log file: {ffmpeg_console_log}")
             
-            ffmpeg_elapsed_time = time.time() - ffmpeg_start_time
-            logging.info(f"FFmpeg process started successfully (PID: {self.ffmpeg_process.pid}), ffmpeg启动耗时: {ffmpeg_elapsed_time:.2f}s")
+            logging.info(f"FFmpeg process spawned successfully (PID: {self.ffmpeg_process.pid})")
             
             # Start a background task to monitor ffmpeg console log
             stderr_monitor_task = asyncio.create_task(self._monitor_ffmpeg_stderr(ffmpeg_console_log))
@@ -781,6 +783,50 @@ async def receive_message(ws) -> TranslateResponseData:
         end_time=Response_data.end_time if hasattr(Response_data, 'end_time') else None
     )
 
+async def send_silence_until_ready(conn, session_id, audio_ready_event, timeout_seconds=8):
+    """Send silence frames until real audio is ready or timeout"""
+    silence_chunk = b'\x00' * 640  # 640 bytes of silence (20ms at 16kHz mono s16le)
+    silence_start_time = time.monotonic()
+    frame_count = 0
+    
+    logging.info(f"🔇 Starting silence bridge (timeout: {timeout_seconds}s)")
+    
+    try:
+        while not audio_ready_event.is_set():
+            # Check timeout
+            elapsed = time.monotonic() - silence_start_time
+            if elapsed >= timeout_seconds:
+                logging.warning(f"🔇 Silence bridge timeout after {elapsed:.2f}s, {frame_count} frames sent")
+                break
+            
+            # Send silence frame
+            chunk_request = TranslateRequestData(
+                session_id=session_id,
+                event="Type_TaskRequest",
+                source_audio=Audio(binary_data=silence_chunk)
+            )
+            
+            await send_request(conn, chunk_request)
+            frame_count += 1
+            
+            # Log every 50 frames (1 second)
+            if frame_count % 50 == 0:
+                logging.info(f"🔇 Silence bridge: {frame_count} frames sent ({elapsed:.1f}s)")
+            
+            # Wait 20ms for next frame
+            await asyncio.sleep(0.02)
+        
+        # Audio is ready
+        silence_duration = time.monotonic() - silence_start_time
+        if audio_ready_event.is_set():
+            logging.info(f"🔇 Silence bridge completed: {frame_count} frames sent in {silence_duration:.2f}s")
+        return silence_duration, frame_count
+        
+    except Exception as e:
+        silence_duration = time.monotonic() - silence_start_time
+        logging.error(f"🔇 Silence bridge error after {silence_duration:.2f}s: {e}")
+        return silence_duration, frame_count
+
 def map_event_to_subtitle_json(resp: TranslateResponseData) -> Optional[str]:
     """Map WebSocket events (650-655) to unified JSON format"""
     subtitle_msg = None
@@ -854,6 +900,60 @@ def map_event_to_subtitle_json(resp: TranslateResponseData) -> Optional[str]:
     
     return None
 
+async def connect_websocket_and_start_session(conf: Config, source_language: str, target_language: str, event_logger=None):
+    """Connect to WebSocket and start translation session"""
+    ws_start_time = time.monotonic()
+    
+    # Connect to WebSocket server
+    conn_id = str(uuid.uuid4())
+    headers = await build_http_headers(conf, conn_id)
+    
+    conn = await websockets.connect(
+        conf.ws_url,
+        additional_headers=headers,
+        max_size=1000000000,
+        ping_interval=None
+    )
+    
+    ws_connect_duration = time.monotonic() - ws_start_time
+    log_id = conn.response.headers.get('X-Tt-Logid')
+    logging.info(f"Connected to translation server (log id={log_id}), 连接同声传译websocket耗时: {ws_connect_duration:.2f}s")
+    
+    session_id = str(uuid.uuid4())
+    
+    # Start session
+    start_request = TranslateRequestData(
+        session_id=session_id,
+        event="Type_StartSession",
+        source_audio=Audio(format="wav", rate=16000, bits=16, channel=1),
+        target_audio=Audio(format="pcm", rate=16000, bits=16, channel=1),
+        mode="s2s",
+        source_language=source_language,
+        target_language=target_language
+    )
+    
+    # Log event if logger is provided
+    if event_logger:
+        event_logger.log_send_event(Type.StartSession, start_request)
+    
+    await send_request(conn, start_request)
+    resp = await receive_message(conn)
+    
+    # Log received event if logger is provided
+    if event_logger and resp.event == Type.SessionStarted:
+        event_logger.log_receive_event(resp)
+    
+    if resp.event != Type.SessionStarted:
+        logging.error(f"Unexpected response logid: {log_id}")
+        logging.error(f"Unexpected response: {resp.event}")
+        logging.error(f"Unexpected response message: {resp.message}")
+        await conn.close()
+        raise Exception(f"Failed to start session: {resp.message}")
+    
+    logging.info(f"Translation session (ID={session_id}) started.")
+    
+    return conn, session_id, log_id, ws_connect_duration
+
 async def build_http_headers(conf: Config, conn_id: str) -> Headers:
     """Build WebSocket connection headers from config"""
     headers = Headers({
@@ -864,11 +964,12 @@ async def build_http_headers(conf: Config, conn_id: str) -> Headers:
     })
     return headers
 
-async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None):
+async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None, audio_ready_event=None, ffmpeg_spawn_time=None):
     """Read PCM data in chunks (640 bytes = 20ms at 16kHz mono s16le)"""
     import asyncio
     loop = asyncio.get_event_loop()
     chunk_count = 0
+    first_chunk_received = False
     
     logging.info(f"Starting PCM chunk reading, chunk_size: {chunk_size}")
     
@@ -921,8 +1022,23 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                 break
                 
             chunk_count += 1
-            if chunk_count == 1:
-                logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes")
+            
+            # Handle first PCM chunk arrival
+            if chunk_count == 1 and not first_chunk_received:
+                first_chunk_received = True
+                first_pcm_time = time.monotonic()
+                
+                # Calculate ffmpeg startup time if spawn time is available
+                if ffmpeg_spawn_time is not None:
+                    ffmpeg_startup_duration = first_pcm_time - ffmpeg_spawn_time
+                    logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes, ffmpeg启动耗时: {ffmpeg_startup_duration:.2f}s")
+                else:
+                    logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes")
+                
+                # Signal that audio is ready
+                if audio_ready_event:
+                    audio_ready_event.set()
+                    logging.info(f"🎵 Audio ready event signaled")
             elif chunk_count % 50 == 0:
                 logging.info(f"Successfully read PCM chunk {chunk_count}: {len(chunk)} bytes")
                 # Periodic FFmpeg health check
@@ -961,60 +1077,39 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
     # 初始化事件日志记录器
     event_logger = ASTEventLogger(youtube_url)
     
+    # Create audio ready event for coordination
+    audio_ready_event = asyncio.Event()
+    
     try:
-        # Start streaming pipeline
-        pcm_stream = await streamer.start_streaming_pipeline()
+        # Start both tasks in parallel
+        logging.info("🚀 Starting parallel initialization: ffmpeg + WebSocket...")
+        parallel_start_time = time.monotonic()
         
-        # Connect to WebSocket server
-        ast_ws_start_time = time.time()
-        conn_id = str(uuid.uuid4())
-        headers = await build_http_headers(conf, conn_id)
+        # Task 1: Start ffmpeg streaming pipeline
+        ffmpeg_task = asyncio.create_task(streamer.start_streaming_pipeline())
         
-        conn = await websockets.connect(
-            conf.ws_url,
-            additional_headers=headers,
-            max_size=1000000000,
-            ping_interval=None
-        )
-        ast_ws_elapsed_time = time.time() - ast_ws_start_time
-        logging.info(f"Connected to translation server (log id={conn.response.headers.get('X-Tt-Logid')}), 连接同声传译websocket耗时: {ast_ws_elapsed_time:.2f}s")
-        log_id = conn.response.headers.get('X-Tt-Logid')
-        
-        session_id = str(uuid.uuid4())
-        
-        # Start session
-        start_request = TranslateRequestData(
-            session_id=session_id,
-            event="Type_StartSession",
-            source_audio=Audio(format="wav", rate=16000, bits=16, channel=1),
-            target_audio=Audio(format="pcm", rate=16000, bits=16, channel=1),
-            mode="s2s",
-            source_language=SOURCE_LANGUAGE,
-            target_language=TARGET_LANGUAGE
+        # Task 2: Connect WebSocket and start session
+        websocket_task = asyncio.create_task(
+            connect_websocket_and_start_session(conf, SOURCE_LANGUAGE, TARGET_LANGUAGE, event_logger)
         )
         
-        # 记录发送StartSession事件
-        event_logger.log_send_event(Type.StartSession, start_request)
+        # Wait for both to complete
+        pcm_stream, (conn, session_id, log_id, ws_connect_duration) = await asyncio.gather(
+            ffmpeg_task, websocket_task
+        )
         
-        await send_request(conn, start_request)
-        resp = await receive_message(conn)
-        
-        # 记录接收到的SessionStarted事件
-        if resp.event == Type.SessionStarted:
-            event_logger.log_receive_event(resp)
-        
-        if resp.event != Type.SessionStarted:
-            logging.error(f"Unexpected response logid: {log_id}")
-            logging.error(f"Unexpected response: {resp.event}")
-            logging.error(f"Unexpected response message: {resp.message}")
-            await conn.close()
-            return
-        
-        logging.info(f"Translation session (ID={session_id}) started.")
+        parallel_duration = time.monotonic() - parallel_start_time
+        logging.info(f"🚀 Parallel initialization completed in {parallel_duration:.2f}s")
+        logging.info(f"📊 WebSocket connect duration: {ws_connect_duration:.2f}s")
         
         # Create queues for communication between sender and receiver
         stream_queue = asyncio.Queue()  # Queue for both audio and subtitle data
         finished = asyncio.Event()
+        
+        # Start silence bridge immediately
+        silence_task = asyncio.create_task(
+            send_silence_until_ready(conn, session_id, audio_ready_event, timeout_seconds=8)
+        )
         
         async def send_pcm_chunks():
             chunk_count = 0
@@ -1029,7 +1124,12 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     finished.set()
                     return
                 
-                async for chunk in read_pcm_chunks(pcm_stream, ffmpeg_process=streamer.ffmpeg_process):
+                async for chunk in read_pcm_chunks(
+                    pcm_stream, 
+                    ffmpeg_process=streamer.ffmpeg_process,
+                    audio_ready_event=audio_ready_event,
+                    ffmpeg_spawn_time=streamer.ffmpeg_spawn_time
+                ):
                     if not chunk:
                         logging.info("No more PCM chunks available")
                         break
@@ -1129,6 +1229,14 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     continue
         finally:
             finished.set()
+            
+            # Wait for silence bridge to complete and log results
+            try:
+                silence_duration, silence_frames = await silence_task
+                logging.info(f"🔇 Final silence bridge stats: {silence_frames} frames, {silence_duration:.2f}s")
+            except Exception as e:
+                logging.error(f"🔇 Silence bridge task error: {e}")
+            
             await sender_task
             await receiver_task
             await conn.close()
