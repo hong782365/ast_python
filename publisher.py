@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 import uvicorn
@@ -19,7 +20,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
 
 # Import modified youtube demo functions
-from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData
+from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData, ytdlp_manager
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,7 +31,30 @@ ACCESS_KEY = os.getenv("ACCESS_KEY")
 RESOURCE_ID = os.getenv("RESOURCE_ID")
 WS_URL = os.getenv("WS_URL")
 
-app = FastAPI(title="Audio Stream Publisher", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI应用生命周期管理"""
+    # 启动时执行
+    logging.info("🚀 Publisher starting up - initializing yt-dlp manager...")
+    try:
+        init_start_time = time.time()
+        await ytdlp_manager.warmup()
+        init_elapsed_time = time.time() - init_start_time
+        logging.info(f"🚀 yt-dlp manager initialization completed in {init_elapsed_time:.2f}s")
+    except Exception as e:
+        logging.warning(f"🚀 yt-dlp manager initialization failed (continuing anyway): {e}")
+    
+    yield
+    
+    # 关闭时执行
+    logging.info("🔥 Publisher shutting down - cleaning up yt-dlp manager...")
+    try:
+        ytdlp_manager.cleanup()
+        logging.info("🔥 yt-dlp manager cleanup completed")
+    except Exception as e:
+        logging.error(f"🔥 yt-dlp manager cleanup failed: {e}")
+
+app = FastAPI(title="Audio Stream Publisher", version="1.0.0", lifespan=lifespan)
 
 class IngestStartRequest(BaseModel):
     sessionId: str

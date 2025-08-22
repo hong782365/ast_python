@@ -14,6 +14,8 @@ from typing import Optional, List, Dict, Any, Union
 import websockets
 from websockets import Headers
 from dotenv import load_dotenv
+import yt_dlp
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -270,6 +272,190 @@ class ASTEventLogger:
         with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(log_entry)
 
+# 1) 自定义 logger：把 yt-dlp 的 debug/info/warning/error 写进你的日志系统
+class YtdlpLogger:
+    def __init__(self, name="ytdlp", logfile="youtube/logs/yt-dlp-debug.log"):
+        import logging, os
+        self._log = logging.getLogger(name)
+        if not self._log.handlers:
+            fh = logging.FileHandler(logfile, encoding="utf-8")
+            fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+            fh.setFormatter(fmt)
+            self._log.addHandler(fh)
+            self._log.setLevel(logging.DEBUG)
+        self._ts = time.time()
+
+    def _stamp(self, level, msg):
+        now = time.time()
+        self._log.log(level, f"[+{now - self._ts:.3f}s] {msg}")
+
+    def debug(self, msg):   self._stamp(10, str(msg))  # DEBUG
+    def info(self, msg):    self._stamp(20, str(msg))  # INFO
+    def warning(self, msg): self._stamp(30, str(msg))  # WARNING
+    def error(self, msg):   self._stamp(40, str(msg))  # ERROR
+
+class YtDlpManager:
+    """常驻yt-dlp解析器管理器，提供预热和高效的URL提取"""
+    
+    def __init__(self):
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ytdlp")
+        self.ydl_opts = {
+            'quiet': True,  # 减少输出
+            'no_warnings': True,
+            'format': '234/233/140/bestaudio[ext=m4a]/bestaudio',  # 音频优先级
+            'forcejson': False,
+            'extract_flat': False,
+            'writethumbnail': False,
+            'writeinfojson': False,
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'ignoreerrors': False,
+        }
+        self._ydl = None
+        self._warmed_up = False
+        self.warmup_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # 更可靠的公共预热视频 (Me at the zoo - 第一个YouTube视频)
+        
+    def _create_ydl_instance(self):
+        """创建yt-dlp实例"""
+        if self._ydl is None:
+            logger = YtdlpLogger()
+            # 添加代理配置
+            opts = self.ydl_opts.copy()
+            opts['proxy'] = 'http://127.0.0.1:7897'
+            # 添加cookie支持
+            opts['cookiesfrombrowser'] = ('chrome',)
+            # 强制IPv4
+            opts['forceipv4'] = True
+
+            opts['logger'] = logger
+            
+            self._ydl = yt_dlp.YoutubeDL(opts)
+        return self._ydl
+            
+    async def warmup(self):
+        """预热yt-dlp实例，预编译JS和缓存设置"""
+        if self._warmed_up:
+            logging.info("🔥 yt-dlp already warmed up, skipping...")
+            return
+            
+        logging.info("🔥 Starting yt-dlp warmup with public video...")
+        warmup_start_time = time.time()
+        
+        try:
+            # 在线程池中运行yt-dlp预热
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(self.executor, self._warmup_sync)
+            
+            warmup_elapsed = time.time() - warmup_start_time
+            logging.info(f"🔥 yt-dlp warmup completed in {warmup_elapsed:.2f}s")
+            self._warmed_up = True
+            
+        except Exception as e:
+            logging.warning(f"🔥 yt-dlp warmup failed (will continue anyway): {e}")
+            # 即使预热失败也继续，不影响主流程
+            self._warmed_up = True
+    
+    def _warmup_sync(self):
+        """同步预热方法，在线程池中执行"""
+        try:
+            ydl = self._create_ydl_instance()
+            # 只验证yt-dlp实例创建和基本配置，不实际提取视频
+            # 这样可以预热库本身而无需网络访问
+            logging.info(f"🔥 yt-dlp instance created successfully")
+            logging.info(f"🔥 Warmup options: {ydl.params}")
+            
+            # 使用轻量级的URL提取进行网络预热
+            try:
+                # 仅提取基本信息和URL，不下载
+                info = ydl.extract_info(self.warmup_url, download=False, process=True)
+                
+                # 检查是否成功获取到格式信息
+                formats = info.get('formats', [])
+                if formats:
+                    # 查找最佳音频格式的URL（类似于--get-url功能）
+                    audio_formats = [f for f in formats if f.get('acodec') != 'none']
+                    if audio_formats:
+                        best_url = audio_formats[0].get('url', '')
+                        logging.info(f"🔥 Network warmup successful - extracted URL (length: {len(best_url)})")
+                        logging.info(f"🔥 Video title: {info.get('title', 'Unknown')[:50]}...")
+                    else:
+                        logging.info(f"🔥 Partial warmup - no audio formats found")
+                else:
+                    logging.info(f"🔥 Partial warmup - no formats extracted")
+                    
+            except Exception as net_e:
+                logging.info(f"🔥 Network warmup skipped (network issue): {net_e}")
+                # 网络预热失败不影响整体预热成功
+                
+        except Exception as e:
+            logging.warning(f"🔥 Warmup failed: {e}")
+            raise
+    
+    async def extract_stream_url(self, youtube_url: str) -> str:
+        """异步提取YouTube直播流URL"""
+        logging.info("📡 Extracting stream URL with yt-dlp library...")
+        extract_start_time = time.time()
+        
+        try:
+            # 在线程池中运行yt-dlp以避免阻塞事件循环
+            loop = asyncio.get_event_loop()
+            stream_url = await loop.run_in_executor(
+                self.executor, 
+                self._extract_stream_url_sync, 
+                youtube_url
+            )
+            
+            extract_elapsed = time.time() - extract_start_time
+            logging.info(f"📡 Stream URL extracted in {extract_elapsed:.2f}s")
+            logging.info(f"📡 Stream URL: {stream_url[:100]}...")
+            
+            return stream_url
+            
+        except Exception as e:
+            logging.error(f"📡 Failed to extract stream URL: {e}")
+            raise
+    
+    def _extract_stream_url_sync(self, youtube_url: str) -> str:
+        """同步提取URL方法，在线程池中执行"""
+        try:
+            ydl = self._create_ydl_instance()
+            info = ydl.extract_info(youtube_url, download=False)
+            
+            # 查找最佳音频格式的URL
+            formats = info.get('formats', [])
+            if not formats:
+                raise ValueError("No formats found for this video")
+            
+            # 按照优先级查找音频流
+            audio_formats = [f for f in formats if f.get('acodec') != 'none']
+            if not audio_formats:
+                raise ValueError("No audio formats found for this video")
+            
+            # 优先选择format_id为234/233/140的格式
+            preferred_ids = ['234', '233', '140']
+            for format_id in preferred_ids:
+                for fmt in audio_formats:
+                    if fmt.get('format_id') == format_id:
+                        return fmt['url']
+            
+            # 如果没找到首选格式，使用第一个可用的音频格式
+            return audio_formats[0]['url']
+            
+        except Exception as e:
+            logging.error(f"📡 Sync URL extraction failed: {e}")
+            raise
+    
+    def cleanup(self):
+        """清理资源"""
+        if self.executor:
+            self.executor.shutdown(wait=True)
+        if self._ydl:
+            # yt-dlp实例通常不需要显式清理
+            self._ydl = None
+
+# 全局yt-dlp管理器实例
+ytdlp_manager = YtDlpManager()
+
 class YouTubeLiveStreamer:
     def __init__(self, youtube_url: str, duration_seconds: int = 10):
         self.youtube_url = youtube_url
@@ -309,97 +495,16 @@ class YouTubeLiveStreamer:
         return hashlib.md5(url.encode()).hexdigest()[:8]
         
     async def start_streaming_pipeline(self):
-        """Start yt-dlp (extract URL) + ffmpeg (direct network pull) pipeline for PCM streaming"""
+        """Start yt-dlp (library mode) + ffmpeg (direct network pull) pipeline for PCM streaming"""
         timestamp = time.strftime("%Y%m%dT%H%M%SZ")
-        yt_dlp_log = self.log_dir / f"yt-dlp_{timestamp}.log"
         
         # Create ffmpeg log file paths
         ffmpeg_report_log = self.ffmpeg_report_dir / f"ffmpeg-report-{timestamp}-{self.youtube_url_id}.log"
         ffmpeg_console_log = self.ffmpeg_log_dir / f"ffmpeg-console-{timestamp}-{self.youtube_url_id}.log"
         
-        # Step 1: Use yt-dlp to extract direct stream URL only
-        yt_dlp_cmd = [
-            "yt-dlp",  # yt-dlp 主程序
-            "--force-ipv4",  # 避开慢 IPv6, 预期收益: -3～10s
-            "-f", "234/233/140/bestaudio[ext=m4a]/bestaudio",  # 优先选择纯音频流：234(高质量)>233(低质量)>140>m4a>最佳音频
-            "--get-url",  # 只获取直链URL，不下载
-            "--no-warnings",  # 不显示警告信息
-            # 下面这个参数有问题, 总是失败. 虽然 ChatGPT-5 说它没问题, 但在我这里有问题. 暂时先注释掉, 后面改成 yt-dlp 库模式 + 常驻实例 + 预热 的版本之后再做 A/B 测试.
-            # "--extractor-args", "youtube:player_client=ios,android,web;player_skip=webpage",  # 跳过 HTML, 预期收益: -2～8s  
-                                                                                                # 正确写法：同一站点（youtube）的多个“键=值”用 分号 ; 分隔；同一个键的多个值用 逗号 , 分隔。  
-                                                                                                # 客户端顺序真的有用：很多直播在 iOS 客户端下会给完整的 HLS 音频清单，而 web/TV 可能被 SABR/DRM 实验影响；把 ios 放在最前面，命中率更高。
-            "--cookies-from-browser", "chrome",  # 避免同意页, 预期收益: -1～3s
-            "--verbose",  # --verbose 会强制 yt-dlp 输出更详细的日志，非常适合调试
-            self.youtube_url  # YouTube 直播 URL
-        ]
-        
         try:
-            # Extract direct stream URL using yt-dlp with Popen for real-time control
-            logging.info("Extracting direct stream URL with yt-dlp...")
-            
-            # Open log file for stderr redirection
-            yt_dlp_log_file = open(yt_dlp_log, 'w')
-            
-            # Start yt-dlp process with Popen for real-time stdout control
-            yt_dlp_process = subprocess.Popen(
-                yt_dlp_cmd,
-                stdout=subprocess.PIPE,
-                stderr=yt_dlp_log_file,
-                text=True
-            )
-            
-            logging.info(f"🎬 yt-dlp process started (PID: {yt_dlp_process.pid})")
-            logging.info(f"🎬 yt-dlp stderr log: {yt_dlp_log}")
-            
-            # Start background task to monitor yt-dlp stderr for real-time feedback
-            ytdlp_stderr_monitor_task = asyncio.create_task(
-                self._monitor_ytdlp_stderr(yt_dlp_log, yt_dlp_process)
-            )
-            
-            # Read stdout in real-time with timeout
-            direct_url = ""
-            try:
-                # Monitor yt-dlp process with real-time feedback
-                start_time = time.time()
-                logging.info("🎬 Waiting for yt-dlp to extract direct stream URL...")
-                
-                # Wait for process completion with timeout
-                stdout, stderr = yt_dlp_process.communicate(timeout=30)  # 30秒超时
-                
-                elapsed_time = time.time() - start_time
-                logging.info(f"🎬 yt-dlp completed in {elapsed_time:.2f}s")
-                
-                direct_url = stdout.strip()
-                
-                # Check return code after process completion
-                if yt_dlp_process.returncode != 0:
-                    logging.error(f"🎬 yt-dlp failed with return code: {yt_dlp_process.returncode}")
-                    logging.error(f"🎬 Check yt-dlp stderr log: {yt_dlp_log}")
-                    raise Exception(f"yt-dlp failed with return code: {yt_dlp_process.returncode}")
-                else:
-                    logging.info(f"🎬 yt-dlp succeeded (return code: 0)")
-                    
-            except subprocess.TimeoutExpired:
-                # Kill the process if it times out
-                logging.error("🎬 yt-dlp process timed out after 30 seconds, killing process...")
-                yt_dlp_process.kill()
-                yt_dlp_process.wait()
-                logging.error(f"🎬 yt-dlp process killed (PID: {yt_dlp_process.pid})")
-                raise Exception("yt-dlp process timed out after 30 seconds")
-            finally:
-                # Always close the log file
-                yt_dlp_log_file.close()
-                
-                # Wait for stderr monitor to complete
-                try:
-                    await ytdlp_stderr_monitor_task
-                except Exception as e:
-                    logging.warning(f"🎬 Error waiting for yt-dlp stderr monitor: {e}")
-            
-            if not direct_url:
-                raise Exception("Failed to extract direct stream URL")
-            
-            logging.info(f"Extracted direct stream URL: {direct_url[:100]}...")
+            # Step 1: Use yt-dlp library to extract direct stream URL
+            direct_url = await ytdlp_manager.extract_stream_url(self.youtube_url)
             
             # Step 2: Use ffmpeg to directly pull from network with reconnect parameters
             ffmpeg_cmd = [
@@ -410,10 +515,10 @@ class YouTubeLiveStreamer:
 
                 # --- ↓↓↓ 超低延迟优化参数 ↓↓↓ ---
                 "-fflags", "nobuffer",       # 告诉 demuxer 不要缓冲数据包
-                "-probesize", "32",           # 极大地减小探测数据大小，快速启动
-                "-analyzeduration", "0",      # 不花时间分析流的初始部分
-                "-avioflags", "direct",       # 减少 I/O 层的缓冲
-                "-flush_packets", "1",        # 每处理一个包就立刻刷新，而不是等待
+                # "-probesize", "32",           # 极大地减小探测数据大小，快速启动
+                # "-analyzeduration", "0",      # 不花时间分析流的初始部分
+                # "-avioflags", "direct",       # 减少 I/O 层的缓冲
+                # "-flush_packets", "1",        # 每处理一个包就立刻刷新，而不是等待
                 # "-hls_live_edge", "99999",   # 设置 HLS 直播边缘时间，确保快速响应
                 # --- ↑↑↑ 超低延迟优化参数 ↑↑↑ ---
 
@@ -435,6 +540,7 @@ class YouTubeLiveStreamer:
             logging.info(f"FFmpeg console log: {ffmpeg_console_log}")
             
             # Set up environment for ffmpeg report output
+            ffmpeg_start_time = time.time()
             ffmpeg_env = os.environ.copy()
             ffmpeg_env['FFREPORT'] = f"file={ffmpeg_report_log}:level=48"
             
@@ -471,7 +577,8 @@ class YouTubeLiveStreamer:
                     logging.error(f"Could not read ffmpeg console log: {e}")
                 raise Exception(f"FFmpeg failed to start, check log file: {ffmpeg_console_log}")
             
-            logging.info(f"FFmpeg process started successfully (PID: {self.ffmpeg_process.pid})")
+            ffmpeg_elapsed_time = time.time() - ffmpeg_start_time
+            logging.info(f"FFmpeg process started successfully (PID: {self.ffmpeg_process.pid}), ffmpeg启动耗时: {ffmpeg_elapsed_time:.2f}s")
             
             # Start a background task to monitor ffmpeg console log
             stderr_monitor_task = asyncio.create_task(self._monitor_ffmpeg_stderr(ffmpeg_console_log))
@@ -479,7 +586,7 @@ class YouTubeLiveStreamer:
             # Start a background task to monitor ffmpeg health
             health_monitor_task = asyncio.create_task(self._monitor_ffmpeg_health())
             
-            logging.info(f"Started direct network streaming pipeline, yt-dlp logs: {yt_dlp_log}")
+            logging.info(f"Started direct network streaming pipeline using yt-dlp library")
             return self.ffmpeg_process.stdout
             
         except Exception as e:
@@ -553,71 +660,6 @@ class YouTubeLiveStreamer:
             logging.error(f"🔧 Monitor traceback: {traceback.format_exc()}")
         
         logging.info("🔧 FFmpeg console log monitor ended")
-    
-    async def _monitor_ytdlp_stderr(self, console_log_path, ytdlp_process):
-        """Monitor yt-dlp stderr log file in real-time for better debugging"""
-        if not ytdlp_process:
-            logging.warning("🎬 yt-dlp stderr monitor: No process available")
-            return
-            
-        logging.info(f"🎬 Starting yt-dlp stderr monitor for PID {ytdlp_process.pid}")
-        logging.info(f"🎬 Monitoring log file: {console_log_path}")
-        
-        try:
-            line_count = 0
-            last_position = 0
-            
-            while ytdlp_process.poll() is None:
-                try:
-                    # Check if log file exists and read new lines
-                    if os.path.exists(console_log_path):
-                        with open(console_log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            f.seek(last_position)
-                            new_lines = f.readlines()
-                            last_position = f.tell()
-                            
-                            for line in new_lines:
-                                line_str = line.strip()
-                                if line_str:
-                                    line_count += 1
-                                    # Categorize different types of yt-dlp messages
-                                    if "error" in line_str.lower() or "failed" in line_str.lower():
-                                        logging.error(f"🎬 yt-dlp ERROR: {line_str}")
-                                    elif "warning" in line_str.lower():
-                                        logging.warning(f"🎬 yt-dlp WARNING: {line_str}")
-                                    elif "extracting" in line_str.lower() or "downloading" in line_str.lower():
-                                        logging.info(f"🎬 yt-dlp PROGRESS: {line_str}")
-                                    else:
-                                        logging.debug(f"🎬 yt-dlp: {line_str}")
-                    
-                    # Wait a bit before checking again
-                    await asyncio.sleep(0.5)  # Check more frequently for yt-dlp
-                    
-                except Exception as e:
-                    logging.error(f"🎬 Error reading yt-dlp stderr log: {e}")
-                    await asyncio.sleep(1.0)  # Wait longer on error
-            
-            # Process has exited, read any remaining log content
-            final_exit_code = ytdlp_process.returncode
-            logging.info(f"🎬 yt-dlp process exited with code: {final_exit_code}, total log lines processed: {line_count}")
-            
-            # Read any final content from the log file
-            try:
-                if os.path.exists(console_log_path):
-                    with open(console_log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        f.seek(last_position)
-                        remaining_content = f.read()
-                        if remaining_content.strip():
-                            logging.info(f"🎬 Final yt-dlp log content: {remaining_content}")
-            except Exception as e:
-                logging.error(f"🎬 Error reading final log content: {e}")
-                
-        except Exception as e:
-            logging.error(f"🎬 yt-dlp stderr monitor error: {e}")
-            import traceback
-            logging.error(f"🎬 Monitor traceback: {traceback.format_exc()}")
-        
-        logging.info("🎬 yt-dlp stderr monitor ended")
 
     async def _monitor_ffmpeg_health(self):
         """Monitor FFmpeg process health and network connectivity"""
@@ -694,14 +736,7 @@ class YouTubeLiveStreamer:
             except Exception as e:
                 logging.error(f"Error closing ffmpeg console log file: {e}")
         
-        if self.yt_dlp_process:
-            try:
-                self.yt_dlp_process.terminate()
-                self.yt_dlp_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.yt_dlp_process.kill()
-            except Exception as e:
-                logging.error(f"Error terminating yt-dlp: {e}")
+        # No need to clean up yt_dlp_process since we're using library mode now
 
 async def send_request(ws, request: TranslateRequestData):
     """Send request to WebSocket server"""
@@ -931,6 +966,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         pcm_stream = await streamer.start_streaming_pipeline()
         
         # Connect to WebSocket server
+        ast_ws_start_time = time.time()
         conn_id = str(uuid.uuid4())
         headers = await build_http_headers(conf, conn_id)
         
@@ -940,8 +976,8 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             max_size=1000000000,
             ping_interval=None
         )
-        
-        logging.info(f"Connected to translation server (log id={conn.response.headers.get('X-Tt-Logid')})")
+        ast_ws_elapsed_time = time.time() - ast_ws_start_time
+        logging.info(f"Connected to translation server (log id={conn.response.headers.get('X-Tt-Logid')}), 连接同声传译websocket耗时: {ast_ws_elapsed_time:.2f}s")
         log_id = conn.response.headers.get('X-Tt-Logid')
         
         session_id = str(uuid.uuid4())
@@ -1246,6 +1282,17 @@ async def main():
         logging.error("Missing required environment variables. Please check your .env file.")
         return
     
+    # 预热yt-dlp管理器
+    logging.info("🚀 Initializing application...")
+    init_start_time = time.time()
+    
+    try:
+        await ytdlp_manager.warmup()
+        init_elapsed_time = time.time() - init_start_time
+        logging.info(f"🚀 Application initialization completed in {init_elapsed_time:.2f}s")
+    except Exception as e:
+        logging.warning(f"🚀 Application initialization failed (continuing anyway): {e}")
+    
     conf = Config(
         ws_url=WS_URL,
         app_key=APP_KEY,
@@ -1254,13 +1301,18 @@ async def main():
     )
     
     youtube_url = "https://www.youtube.com/watch?v=HHGEDLPBIxA"
-    duration_seconds = 100  # Test with 10 seconds
+    duration_seconds = 100  # Test with 100 seconds
     
     logging.info(f"Starting YouTube live translation for {duration_seconds} seconds")
     logging.info(f"YouTube URL: {youtube_url}")
     
     start_time = time.time()
-    await translate_youtube_live(conf, youtube_url, duration_seconds)
+    try:
+        await translate_youtube_live(conf, youtube_url, duration_seconds)
+    finally:
+        # 清理资源
+        ytdlp_manager.cleanup()
+        
     end_time = time.time()
     
     logging.info(f"Total processing time: {end_time - start_time:.2f} seconds")
