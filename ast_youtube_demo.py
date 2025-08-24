@@ -310,7 +310,14 @@ class YtDlpManager:
         self.ydl_opts = {
             'quiet': True,  # 减少输出
             'no_warnings': True,
-            'format': '234/233/140/bestaudio[ext=m4a]/bestaudio',  # 音频优先级
+            # 'verbose': True,
+            'format': 'bestaudio[protocol^=m3u8]/bestaudio/140/91/92/93/94/95/96/best', # '234/233/140/bestaudio[ext=m4a]/bestaudio',  # 音频优先级
+            # "extractor_args": {  # 目前这个参数不报错了, 但还没验证其效果, 暂时先注释了.
+            #     "youtube": {
+            #         "player_client": ["ios", "web"],
+            #         "player_skip": ["webpage"]
+            #     }
+            # },
             'forcejson': False,
             'extract_flat': False,
             'writethumbnail': False,
@@ -538,7 +545,7 @@ class YouTubeLiveStreamer:
                 "-f", "s16le",  # 输出格式：16位小端序原始音频
                 "-t", str(self.duration_seconds),  # 限制处理时长（秒）
                 "-y",  # 覆盖输出文件（如果存在）
-                "pipe:1"  # 输出到标准输出（管道）
+                "pipe:1"  # 输出到 stdout 标准输出（管道）
             ]
             
             # Start ffmpeg process directly with network stream
