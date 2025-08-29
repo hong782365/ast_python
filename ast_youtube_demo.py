@@ -311,6 +311,7 @@ class YtDlpManager:
             'quiet': True,  # 减少输出
             'no_warnings': True,
             # 'verbose': True,
+            # 'format': '234/233/140/bestaudio[ext=m4a]/bestaudio',  # 音频优先级
             'format': 'bestaudio[protocol^=m3u8]/bestaudio/140/91/92/93/94/95/96/best', # '234/233/140/bestaudio[ext=m4a]/bestaudio',  # 音频优先级
             # "extractor_args": {  # 目前这个参数不报错了, 但还没验证其效果, 暂时先注释了.
             #     "youtube": {
@@ -328,7 +329,7 @@ class YtDlpManager:
         }
         self._ydl = None
         self._warmed_up = False
-        self.warmup_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"  # 更可靠的公共预热视频 (Me at the zoo - 第一个YouTube视频)
+        self.warmup_url = "https://www.youtube.com/watch?v=G3_Um0yIsow"  # 公共预热视频: 3 秒倒计时(纯人声)
         
     def _create_ydl_instance(self):
         """创建yt-dlp实例"""
@@ -336,9 +337,14 @@ class YtDlpManager:
             logger = YtdlpLogger()
             # 添加代理配置
             opts = self.ydl_opts.copy()
-            opts['proxy'] = 'http://127.0.0.1:7897'
-            # 添加cookie支持
-            opts['cookiesfrombrowser'] = ('chrome',)
+            # opts['proxy'] = 'http://127.0.0.1:7897'
+            # 添加cookie支持 - 从文件读取
+            cookie_file = os.path.join(current_dir, "youtube", "cookie", "youtube_hongc_cookies.txt")
+            if os.path.exists(cookie_file):
+                opts['cookiefile'] = cookie_file
+                logging.info(f"🍪 Loading cookies from: {cookie_file}")
+            else:
+                logging.warning(f"🍪 Cookie file not found: {cookie_file}")
             # 强制IPv4
             opts['forceipv4'] = True
 
@@ -526,7 +532,7 @@ class YouTubeLiveStreamer:
                 "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg",  # ffmpeg 主程序
                 "-hide_banner",  # 隐藏 ffmpeg 启动横幅信息
                 "-report",  # 它会生成一个详细的报告文件，完整记录 FFmpeg 的所有命令行输出（无论你在 -loglevel 设置了什么级别）、运行环境、库版本等信息。当你的 Python 脚本无法完全捕获实时输出时，这个报告文件就是你最终的真相来源。
-                "-loglevel", "error",  # verbose 恢复详细日志以诊断问题
+                "-loglevel", "verbose",  # verbose 恢复详细日志以诊断问题
 
                 # --- ↓↓↓ 超低延迟优化参数 ↓↓↓ ---
                 "-fflags", "nobuffer",       # 告诉 demuxer 不要缓冲数据包
@@ -537,7 +543,7 @@ class YouTubeLiveStreamer:
                 # "-hls_live_edge", "99999",   # 设置 HLS 直播边缘时间，确保快速响应
                 # --- ↑↑↑ 超低延迟优化参数 ↑↑↑ ---
 
-                "-http_proxy", "http://127.0.0.1:7897",
+                # "-http_proxy", "http://127.0.0.1:7897",
                 "-i", direct_url,  # 输入源：直接从网络URL读取
                 "-ac", "1",  # 音频通道数：1（单声道）
                 "-ar", "16000",  # 音频采样率：16000Hz
@@ -872,6 +878,8 @@ async def send_silence_until_ready(conn, session_id, audio_ready_event, timeout_
     except Exception as e:
         silence_duration = time.monotonic() - silence_start_time
         logging.error(f"🔇 Silence bridge error after {silence_duration:.2f}s: {e}")
+        import traceback
+        logging.error(f"🔇 Silence bridge traceback: {traceback.format_exc()}")
         return silence_duration, frame_count
 
 def map_event_to_subtitle_json(resp: TranslateResponseData) -> Optional[str]:
@@ -1036,7 +1044,7 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
             # Add timeout to detect if ffmpeg is stuck
             try:
                 # Use much longer timeout for first chunk to skip through ad segments
-                timeout_duration = 12.0 if chunk_count == 0 else 10.0
+                timeout_duration = 30.0 if chunk_count == 0 else 10.0
                 chunk = await asyncio.wait_for(
                     loop.run_in_executor(None, pcm_stream.read, chunk_size),
                     timeout=timeout_duration
@@ -1155,7 +1163,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         
         # Start silence bridge immediately
         silence_task = asyncio.create_task(
-            send_silence_until_ready(conn, session_id, audio_ready_event, timeout_seconds=8)
+            send_silence_until_ready(conn, session_id, audio_ready_event, timeout_seconds=18)
         )
         
         async def send_pcm_chunks():
@@ -1259,6 +1267,8 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                         
             except Exception as e:
                 logging.error(f"Receive message error: {e}")
+                import traceback
+                logging.error(f"Receive message traceback: {traceback.format_exc()}")
                 finished.set()
         
         # Start sender and receiver tasks
@@ -1283,6 +1293,8 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                 logging.info(f"🔇 Final silence bridge stats: {silence_frames} frames, {silence_duration:.2f}s")
             except Exception as e:
                 logging.error(f"🔇 Silence bridge task error: {e}")
+                import traceback
+                logging.error(f"🔇 Silence bridge task traceback: {traceback.format_exc()}")
             
             await sender_task
             await receiver_task
@@ -1290,6 +1302,8 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             
     except Exception as e:
         logging.error(f"Translation streaming error: {e}")
+        import traceback
+        logging.error(f"Translation streaming traceback: {traceback.format_exc()}")
     finally:
         await streamer.cleanup()
 
@@ -1406,6 +1420,8 @@ async def translate_youtube_live(conf: Config, youtube_url: str, duration_second
                     
         except Exception as e:
             logging.error(f"Receive message error: {e}")
+            import traceback
+            logging.error(f"Receive message traceback: {traceback.format_exc()}")
         finally:
             await sender_task
             await conn.close()
@@ -1428,6 +1444,8 @@ async def translate_youtube_live(conf: Config, youtube_url: str, duration_second
             
     except Exception as e:
         logging.error(f"Translation error: {e}")
+        import traceback
+        logging.error(f"Translation traceback: {traceback.format_exc()}")
     finally:
         await streamer.cleanup()
 
@@ -1484,3 +1502,5 @@ if __name__ == "__main__":
         logging.info("Process interrupted by user")
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
+        import traceback
+        logging.error(f"Unexpected error traceback: {traceback.format_exc()}")
