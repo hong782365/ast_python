@@ -1,30 +1,32 @@
 # StreamLingua Python 服务 Cloudflare Containers 部署指南
 
-> **版本**: v1.0  
-> **更新日期**: 2025-08-29  
-> **适用项目**: StreamLingua 同声传译 Web 应用
+> **版本**: v2.0  
+> **更新日期**: 2025-08-30  
+> **适用项目**: StreamLingua 同声传译 Web 应用  
+> **架构**: 独立 Workers + Service Bindings
 
 ---
 
 ## 🎯 部署概述
 
-### 目标架构
+### 目标架构 (更新)
 ```
-NextJS (streamlingua.live) 
+NextJS (streamlingua.live)
     ↓ HTTP API
-ws-gateway (ws.streamlingua.live) 
+ast_python_workers (inner.streamlingua.live)
     ↓ Container Management
 Python Container (Cloudflare Containers)
     ↓ WebSocket Connection
-ws-gateway (WebSocket Publisher)
-    ↓ Audio Stream Broadcast  
+ws-gateway (ws.streamlingua.live)
+    ↓ Audio Stream Broadcast
 Users (WebSocket Subscribers)
 ```
 
 ### 核心组件
 - **Python Container**: 运行 `publisher.py` 服务
-- **ws-gateway**: 扩展为容器管理 + WebSocket 路由
-- **Dockerfile**: Python 环境和依赖打包
+- **ast_python_workers**: 专门管理 Python 容器的 Workers
+- **ws-gateway**: 专注于 WebSocket 路由功能
+- **Service Bindings**: 未来优化服务间通信
 
 ---
 
@@ -32,11 +34,24 @@ Users (WebSocket Subscribers)
 
 ### 1. 环境要求
 - **Node.js**: 20+ (用于 wrangler)
-- **Docker**: 最新版本 (用于镜像构建)
+- **Docker Desktop**: 最新版本 (必需，用于本地构建镜像)
 - **Cloudflare 账户**: 付费计划 (支持 Containers)
 - **wrangler CLI**: 最新版本
 
 ```bash
+# 安装 Docker Desktop (必需)
+# macOS:
+brew install --cask docker
+
+# 或从官网下载: https://www.docker.com/products/docker-desktop/
+
+# 启动 Docker Desktop (必须运行)
+open -a Docker
+
+# 验证 Docker 运行状态 (必需步骤)
+docker version
+docker ps
+
 # 安装 wrangler
 npm install -g wrangler@latest
 
@@ -47,7 +62,7 @@ wrangler --version
 wrangler auth login
 ```
 
-### 2. 项目结构确认
+### 2. 项目结构确认 (更新)
 ```
 📁 工作区/
 ├── 📁 s2s/ast_python/                    # Python 项目
@@ -57,10 +72,15 @@ wrangler auth login
 │   ├── Dockerfile                        # 新建
 │   └── docs/                             # 文档目录
 │
-└── 📁 nextjs/example/ws-gateway/         # Worker 项目
-    ├── wrangler.jsonc                    # 需要修改
-    ├── src/index.js                      # 需要扩展
-    └── package.json                      # 需要更新依赖
+├── 📁 nextjs/example/ws-gateway/         # WebSocket Worker 项目 (保持不变)
+│   ├── wrangler.jsonc                    # 无需修改
+│   ├── src/index.js                     # 无需修改
+│   └── package.json                     # 无需修改
+│
+└── 📁 ast_python_workers/                # 新建：Python 容器管理 Worker
+    ├── wrangler.jsonc                    # 新建
+    ├── src/index.js                     # 新建
+    └── package.json                     # 新建
 ```
 
 ---
@@ -104,49 +124,73 @@ CMD ["python", "publisher.py"]
 ### 验证 Dockerfile
 
 ```bash
+# 确保 Docker Desktop 正在运行
+docker version
+
 # 在 Python 项目目录测试构建
 cd /Users/weihongwang/Documents/workspace/s2s/ast_python
 docker build -t streamlingua-python:test .
 
-# 测试运行（可选）
+# 验证镜像构建成功
+docker images | grep streamlingua-python
+
+# 测试运行（可选，需要 .env 文件）
 docker run -p 9000:9000 --env-file .env streamlingua-python:test
 ```
 
+**⚠️ 重要提醒**:
+- **Docker Desktop 必须在后台运行**，否则 wrangler deploy 会失败
+- 首次构建可能需要较长时间（下载基础镜像）
+- 镜像大小限制为 2GB
+
 ---
 
-## ⚙️ Step 2: 配置 ws-gateway
+## ⚙️ Step 2: 创建 ast_python_workers 项目
 
-### 2.1 修改 package.json
+### 2.1 创建项目目录
 
-**文件路径**: `/Users/weihongwang/Documents/workspace/nextjs/example/ws-gateway/package.json`
+```bash
+# 创建新的 Workers 项目目录
+mkdir -p /Users/weihongwang/Documents/workspace/ast_python_workers
+cd /Users/weihongwang/Documents/workspace/ast_python_workers
+```
+
+### 2.2 创建 package.json
+
+**文件路径**: `/Users/weihongwang/Documents/workspace/ast_python_workers/package.json`
 
 ```json
 {
-  "name": "ws-gateway",
+  "name": "ast-python-workers",
   "version": "1.0.0",
+  "description": "Cloudflare Workers for managing StreamLingua Python containers",
+  "main": "src/index.js",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
   },
   "dependencies": {
     "@cloudflare/containers": "^1.0.0"
   },
   "devDependencies": {
     "wrangler": "^3.0.0"
-  }
+  },
+  "author": "StreamLingua Team",
+  "license": "MIT"
 }
 ```
 
-### 2.2 修改 wrangler.jsonc
+### 2.3 创建 wrangler.jsonc
 
-**文件路径**: `/Users/weihongwang/Documents/workspace/nextjs/example/ws-gateway/wrangler.jsonc`
+**文件路径**: `/Users/weihongwang/Documents/workspace/ast_python_workers/wrangler.jsonc`
 
 ```jsonc
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "ws-gateway",
+  "name": "ast-python-service",
   "main": "src/index.js",
-  "compatibility_date": "2025-08-16",
+  "compatibility_date": "2025-08-30",
   "observability": {
     "enabled": true
   },
@@ -155,7 +199,7 @@ docker run -p 9000:9000 --env-file .env streamlingua-python:test
   "containers": [
     {
       "name": "python-service",
-      "image": "../../../s2s/ast_python/Dockerfile",
+      "image": "../s2s/ast_python/Dockerfile",
       "tag": "v1.0.0",
       "port": 9000,
       "enableInternet": true
@@ -165,10 +209,6 @@ docker run -p 9000:9000 --env-file .env streamlingua-python:test
   // Durable Objects 配置
   "durable_objects": {
     "bindings": [
-      {
-        "name": "WS_GATEWAY_ROOM",
-        "class_name": "WSGatewayRoom"
-      },
       {
         "name": "PYTHON_CONTAINER",
         "class_name": "PythonContainerManager"
@@ -180,32 +220,40 @@ docker run -p 9000:9000 --env-file .env streamlingua-python:test
   "migrations": [
     {
       "tag": "v1",
-      "new_classes": ["WSGatewayRoom"]
-    },
-    {
-      "tag": "v2", 
       "new_classes": ["PythonContainerManager"]
     }
   ],
   
-  // 环境变量（敏感信息）
+  // 自定义域名路由
+  "routes": [
+    {
+      "pattern": "inner.streamlingua.live/*",
+      "zone_name": "streamlingua.live"
+    }
+  ],
+  
+  // 环境变量（非敏感信息）
   "vars": {
-    "PYTHON_SERVICE_VERSION": "v1.0.0"
+    "SERVICE_NAME": "StreamLingua Python Service",
+    "SERVICE_VERSION": "v1.0.0"
   }
 }
 ```
 
-### 2.3 扩展 index.js
+### 2.4 创建 src/index.js
 
-**文件路径**: `/Users/weihongwang/Documents/workspace/nextjs/example/ws-gateway/src/index.js`
-
-在现有代码基础上添加容器管理功能：
+**文件路径**: `/Users/weihongwang/Documents/workspace/ast_python_workers/src/index.js`
 
 ```javascript
-// 导入容器支持
+// StreamLingua Python 容器管理 Workers
 import { Container, DurableObject } from '@cloudflare/containers';
 
-// 新增：Python 容器管理的 Durable Object
+// 辅助函数：生成时间戳
+function getTimestamp() {
+  return new Date().toISOString();
+}
+
+// Python 容器管理的 Durable Object
 export class PythonContainerManager extends DurableObject {
   constructor(state, env) {
     super(state, env);
@@ -220,89 +268,124 @@ export class PythonContainerManager extends DurableObject {
   async fetch(request) {
     const url = new URL(request.url);
     
+    console.log(`[${getTimestamp()}] Container request: ${url.pathname}`);
+    
     // 健康检查
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({
+        service: 'StreamLingua Python Container',
         status: 'healthy',
         container_running: this.container.running,
         timestamp: Date.now()
       }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
       });
     }
     
     // 确保容器运行
     if (!this.container.running) {
-      console.log('Starting Python container...');
-      await this.container.start();
+      console.log(`[${getTimestamp()}] Starting Python container...`);
       
-      // 等待容器就绪（最多30秒）
-      let attempts = 0;
-      while (!this.container.running && attempts < 30) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        attempts++;
+      try {
+        await this.container.start();
+        
+        // 等待容器就绪（最多60秒）
+        let attempts = 0;
+        while (!this.container.running && attempts < 60) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          attempts++;
+        }
+        
+        if (!this.container.running) {
+          console.error(`[${getTimestamp()}] Container failed to start after ${attempts} attempts`);
+          return new Response(JSON.stringify({
+            error: 'Container failed to start',
+            attempts: attempts
+          }), { 
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+        
+        console.log(`[${getTimestamp()}] Python container started successfully in ${attempts} seconds`);
+        
+      } catch (error) {
+        console.error(`[${getTimestamp()}] Container start error:`, error);
+        return new Response(JSON.stringify({
+          error: 'Container start failed',
+          message: error.message
+        }), { 
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
       }
-      
-      if (!this.container.running) {
-        return new Response('Container failed to start', { status: 500 });
-      }
-      
-      console.log('Python container started successfully');
     }
     
     // 转发请求到 Python 容器
     try {
-      return await this.container.fetch(request);
+      console.log(`[${getTimestamp()}] Forwarding request to container`);
+      const response = await this.container.fetch(request);
+      console.log(`[${getTimestamp()}] Container response status: ${response.status}`);
+      
+      return response;
+      
     } catch (error) {
-      console.error('Container fetch error:', error);
-      return new Response('Container error: ' + error.message, { status: 500 });
+      console.error(`[${getTimestamp()}] Container fetch error:`, error);
+      return new Response(JSON.stringify({
+        error: 'Container communication failed',
+        message: error.message
+      }), { 
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
   }
 }
 
-// 保持原有的 WSGatewayRoom 类不变
-export class WSGatewayRoom {
-  // ... 现有的 WebSocket 管理逻辑保持不变 ...
-}
-
-// 修改主 Worker，添加容器路由
+// 主 Worker 入口
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     
-    // 健康检查
+    console.log(`[${getTimestamp()}] Incoming request: ${url.pathname}`);
+    
+    // CORS 预检请求处理
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+          'Access-Control-Max-Age': '86400',
+        }
+      });
+    }
+    
+    // 根路径健康检查
     if (url.pathname === "/" || url.pathname === "/health") {
       return new Response(JSON.stringify({
-        service: "WSGateway + Python Container Manager",
+        service: env.SERVICE_NAME || "StreamLingua Python Service",
+        version: env.SERVICE_VERSION || "v1.0.0",
         timestamp: Date.now(),
-        version: env.PYTHON_SERVICE_VERSION || "unknown"
+        endpoint: url.hostname
       }), {
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
       });
     }
 
-    // 新增：Python 容器路由
-    if (url.pathname.startsWith("/python/") || url.pathname.startsWith("/ingest/")) {
-      const containerId = env.PYTHON_CONTAINER.idFromName("main-container");
-      const containerObj = env.PYTHON_CONTAINER.get(containerId);
-      return containerObj.fetch(request);
-    }
-
-    // 原有的 WebSocket 处理逻辑保持不变
-    if (url.pathname.startsWith("/ws/")) {
-      const sessionId = url.searchParams.get("sessionId");
-      
-      if (!sessionId) {
-        return new Response("Missing sessionId parameter", { status: 400 });
-      }
-
-      const durableObjectId = env.WS_GATEWAY_ROOM.idFromName(sessionId);
-      const durableObject = env.WS_GATEWAY_ROOM.get(durableObjectId);
-      
-      return durableObject.fetch(request);
-    }
-
-    return new Response("Not found", { status: 404 });
+    // 所有其他请求转发到 Python 容器
+    // 使用固定 ID 确保只有一个常驻容器
+    const containerId = env.PYTHON_CONTAINER.idFromName("main-container");
+    const containerObj = env.PYTHON_CONTAINER.get(containerId);
+    
+    return containerObj.fetch(request);
   }
 };
 ```
@@ -314,10 +397,10 @@ export default {
 ### 3.1 安装依赖
 
 ```bash
-cd /Users/weihongwang/Documents/workspace/nextjs/example/ws-gateway
+cd /Users/weihongwang/Documents/workspace/ast_python_workers
 
-# 安装新依赖
-npm install @cloudflare/containers
+# 安装依赖
+npm install
 
 # 验证 wrangler 配置
 wrangler config check
@@ -326,14 +409,14 @@ wrangler config check
 ### 3.2 设置环境变量
 
 ```bash
+# 进入 ast_python_workers 目录
+cd /Users/weihongwang/Documents/workspace/ast_python_workers
+
 # 设置 Python 服务需要的敏感环境变量
 wrangler secret put APP_KEY
 wrangler secret put ACCESS_KEY  
 wrangler secret put RESOURCE_ID
 wrangler secret put WS_URL
-
-# 设置 WebSocket 共享密钥
-wrangler secret put WS_SHARED_SECRET
 
 # 列出所有密钥确认
 wrangler secret list
@@ -342,38 +425,46 @@ wrangler secret list
 ### 3.3 首次部署
 
 ```bash
-# 在 ws-gateway 目录执行部署
-cd /Users/weihongwang/Documents/workspace/nextjs/example/ws-gateway
+# 在 ast_python_workers 目录执行部署
+cd /Users/weihongwang/Documents/workspace/ast_python_workers
 
-# 部署（会自动构建 Python 镜像）
+# 部署（会在本地构建镜像，然后上传）
 wrangler deploy
 
+# 实际执行过程：
+# 1. 🐳 在本地构建 Docker 镜像 (需要 Docker 运行)
+# 2. 📤 推送镜像到 Cloudflare 容器注册表
+# 3. 🚀 部署 Worker 代码到全球节点
+# 4. 🔗 配置容器与 Worker 的关联
+
 # 预期输出：
-# ✨ Uploading container image...
-# 🏗️ Building Python service container...  
-# 📤 Uploading to Cloudflare Container Registry...
+# ✨ Building container image locally...
+# 🏗️ Docker build completed successfully  
+# 📤 Pushing to registry.cloudflare.com...
 # 🚀 Deploying Worker with containers...
-# ✅ Successfully deployed to https://ws-gateway.your-account.workers.dev
+# ✅ Successfully deployed to https://inner.streamlingua.live
 ```
 
 ### 3.4 验证部署
 
 ```bash
 # 测试健康检查
-curl https://ws.streamlingua.live/health
+curl https://inner.streamlingua.live/health
 
 # 期望返回：
 # {
-#   "service": "WSGateway + Python Container Manager",
+#   "service": "StreamLingua Python Service",
+#   "version": "v1.0.0",
 #   "timestamp": 1693304400000,
-#   "version": "v1.0.0"
+#   "endpoint": "inner.streamlingua.live"
 # }
 
-# 测试容器健康状态
-curl https://ws.streamlingua.live/python/health
+# 测试容器健康状态 
+curl https://inner.streamlingua.live/health
 
 # 期望返回：
 # {
+#   "service": "StreamLingua Python Container",
 #   "status": "healthy", 
 #   "container_running": true,
 #   "timestamp": 1693304400000
@@ -394,9 +485,9 @@ const response = await fetch('http://localhost:9000/ingest/start', {
 });
 ```
 
-**更新后**（通过 ws-gateway 调用）：
+**更新后**（通过 ast_python_workers 调用）：
 ```javascript
-const response = await fetch('https://ws.streamlingua.live/ingest/start', {
+const response = await fetch('https://inner.streamlingua.live/ingest/start', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
@@ -409,6 +500,83 @@ const response = await fetch('https://ws.streamlingua.live/ingest/start', {
 });
 ```
 
+### NextJS 环境变量配置
+
+**更新 NextJS 项目的环境变量**：
+```bash
+# .env.local or .env.production
+NEXT_PUBLIC_PYTHON_SERVICE_URL=https://inner.streamlingua.live
+NEXT_PUBLIC_WS_GATEWAY_URL=wss://ws.streamlingua.live
+```
+
+### 示例：完整的调用函数
+
+```javascript
+// utils/pythonService.js
+const PYTHON_SERVICE_URL = process.env.NEXT_PUBLIC_PYTHON_SERVICE_URL || 'https://inner.streamlingua.live';
+
+export async function startTranslation(sessionId, youtubeUrl, token) {
+  try {
+    const response = await fetch(`${PYTHON_SERVICE_URL}/ingest/start`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: sessionId,
+        youtube_url: youtubeUrl,
+        publishUrl: `wss://ws.streamlingua.live/ws/publish?sessionId=${sessionId}&token=${token}`
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const result = await response.json();
+    console.log('Translation started:', result);
+    return result;
+    
+  } catch (error) {
+    console.error('Failed to start translation:', error);
+    throw error;
+  }
+}
+
+export async function stopTranslation(sessionId) {
+  try {
+    const response = await fetch(`${PYTHON_SERVICE_URL}/ingest/stop`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: sessionId
+      })
+    });
+
+    const result = await response.json();
+    console.log('Translation stopped:', result);
+    return result;
+    
+  } catch (error) {
+    console.error('Failed to stop translation:', error);
+    throw error;
+  }
+}
+
+export async function checkServiceHealth() {
+  try {
+    const response = await fetch(`${PYTHON_SERVICE_URL}/health`);
+    const result = await response.json();
+    return result;
+  } catch (error) {
+    console.error('Service health check failed:', error);
+    return { status: 'error', message: error.message };
+  }
+}
+```
+
 ---
 
 ## 🔧 Step 5: 更新和维护
@@ -418,10 +586,10 @@ const response = await fetch('https://ws.streamlingua.live/ingest/start', {
 当需要更新 Python 服务时：
 
 ```bash
-cd /Users/weihongwang/Documents/workspace/nextjs/example/ws-gateway
+cd /Users/weihongwang/Documents/workspace/ast_python_workers
 
 # 方法1：更新版本标签（推荐）
-# 编辑 wrangler.jsonc，修改 tag: "v1.0.1"
+# 编辑 wrangler.jsonc，修改 tag: "v1.0.1"  
 # 然后部署
 wrangler deploy
 
@@ -433,40 +601,95 @@ wrangler deploy --force
 
 ```bash
 # 查看 Worker 日志
+cd /Users/weihongwang/Documents/workspace/ast_python_workers
 wrangler tail
 
 # 查看容器状态
-curl https://ws.streamlingua.live/python/health
+curl https://inner.streamlingua.live/health
 
 # 查看活跃会话
-curl https://ws.streamlingua.live/python/sessions
+curl https://inner.streamlingua.live/sessions
 ```
 
 ### 5.3 故障排除
 
 **常见问题**：
 
-1. **容器启动失败**
+1. **Docker 相关问题**
+   ```bash
+   # Docker 未运行
+   # 错误：Cannot connect to the Docker daemon
+   # 解决：确保 Docker Desktop 正在运行
+   open -a Docker
+   docker version
+   
+   # Docker 空间不足
+   # 错误：no space left on device
+   # 解决：清理 Docker 资源
+   docker system prune -a
+   docker volume prune
+   
+   # Docker 权限问题
+   # 错误：permission denied
+   # 解决：确保用户在 docker 组中
+   sudo usermod -aG docker $USER
+   ```
+
+2. **镜像构建失败**
    ```bash
    # 检查镜像构建日志
    wrangler deploy --verbose
    
    # 本地测试 Dockerfile
-   cd /path/to/python/project
+   cd /Users/weihongwang/Documents/workspace/s2s/ast_python
    docker build -t test-image .
+   
+   # 检查镜像大小（限制 2GB）
+   docker images | grep test-image
+   
+   # 如果镜像过大，优化 Dockerfile
+   # 使用 .dockerignore 文件排除不需要的文件
    ```
 
-2. **网络连接问题**
+3. **镜像推送失败**
+   ```bash
+   # 网络连接问题
+   # 确保可以访问 registry.cloudflare.com
+   curl -I https://registry.cloudflare.com
+   
+   # 认证问题
+   # 重新登录 Cloudflare
+   wrangler auth login
+   
+   # 手动推送镜像测试
+   wrangler containers push python-service
+   ```
+
+4. **网络连接问题**
    ```bash
    # 确认 enableInternet 配置
    # 检查环境变量设置
    wrangler secret list
    ```
 
-3. **WebSocket 连接断开**
+5. **WebSocket 连接断开**
    ```bash
    # 检查心跳机制
    # 确认 100 秒超时处理
+   ```
+
+6. **容器启动超时**
+   ```bash
+   # 容器启动时间过长（>60秒）
+   # 可能原因：
+   # - Python 依赖安装时间长
+   # - 镜像过大导致拉取缓慢
+   # - 容器初始化逻辑复杂
+   
+   # 解决方案：
+   # - 优化 Dockerfile，使用多阶段构建
+   # - 减少 requirements.txt 中的依赖
+   # - 预热常用的 Python 库
    ```
 
 ---
@@ -538,16 +761,18 @@ export class PythonContainerManager extends DurableObject {
 ## 📝 部署检查清单
 
 ### 部署前检查
+- [ ] **Docker Desktop 已安装并运行** (必需)
 - [ ] Python 项目 Dockerfile 创建完成
-- [ ] ws-gateway wrangler.jsonc 配置更新
-- [ ] ws-gateway index.js 容器管理代码添加
+- [ ] ast_python_workers 项目创建完成
+- [ ] wrangler.jsonc 配置正确
 - [ ] 环境变量和密钥设置完成
-- [ ] 本地 Docker 测试通过
+- [ ] 本地 Docker 镜像构建测试通过
 
 ### 部署中检查  
 - [ ] `wrangler deploy` 执行成功
-- [ ] 容器镜像上传完成
-- [ ] Worker 部署到正确域名
+- [ ] **Docker 镜像本地构建成功**
+- [ ] **镜像推送到 Cloudflare 注册表成功**
+- [ ] Worker 部署到正确域名 (inner.streamlingua.live)
 - [ ] 健康检查接口响应正常
 
 ### 部署后验证
