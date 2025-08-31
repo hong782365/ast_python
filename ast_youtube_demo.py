@@ -286,6 +286,11 @@ class YtdlpLogger:
         import logging, os
         self._log = logging.getLogger(name)
         if not self._log.handlers:
+            # 确保日志目录存在
+            log_dir = os.path.dirname(logfile)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+                
             fh = logging.FileHandler(logfile, encoding="utf-8")
             fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
             fh.setFormatter(fmt)

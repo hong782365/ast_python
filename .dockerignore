@@ -1,0 +1,75 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments (本地环境产物，避免ARM64产物进入镜像)
+.venv/
+venv/
+env/
+ENV/
+
+# FFmpeg 解压后的临时目录
+ffmpeg-*/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+temp/
+logs/
+
+# Development and testing
+.pytest_cache/
+.coverage
+.tox/
+.cache
+.mypy_cache/
+.pytest_cache/
+
+# Documentation (we already have the source)
+docs/
+*.md
+
+# Git
+.git/
+.gitignore
+
+# Environment files (should be provided via secrets)
+.env
+.env.local
+.env.*.local
+
+# Output directories
+output/
+youtube/logs/
+youtube/ffmpeg/log/
+youtube/ast_event/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Node modules if any
+node_modules/

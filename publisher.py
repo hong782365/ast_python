@@ -1,27 +1,72 @@
-import asyncio
-import logging
-import time
-import json
-import uuid
-import os
+#!/usr/bin/env python3
+
+# Import sys first for logging
 import sys
-from pathlib import Path
-from typing import Optional, Dict, Any
-from dataclasses import dataclass
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from contextlib import asynccontextmanager
-import websockets
-from websockets.exceptions import ConnectionClosed, WebSocketException
-import uvicorn
+import os
+
+# Basic startup logging - this should appear immediately
+print("🚀 [STARTUP] Publisher script starting...")
+print(f"🚀 [STARTUP] Python version: {sys.version}")
+print(f"🚀 [STARTUP] Current working directory: {os.getcwd()}")
+
+try:
+    import asyncio
+    import logging
+    import time
+    import json
+    import uuid
+    from pathlib import Path
+    from typing import Optional, Dict, Any
+    from dataclasses import dataclass
+    print("✅ [STARTUP] Basic imports successful")
+except Exception as e:
+    print(f"❌ [STARTUP] Basic imports failed: {e}")
+    sys.exit(1)
+
+try:
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
+    from contextlib import asynccontextmanager
+    print("✅ [STARTUP] FastAPI imports successful")
+except Exception as e:
+    print(f"❌ [STARTUP] FastAPI imports failed: {e}")
+    sys.exit(1)
+
+try:
+    import websockets
+    from websockets.exceptions import ConnectionClosed, WebSocketException
+    print("✅ [STARTUP] WebSocket imports successful")
+except Exception as e:
+    print(f"❌ [STARTUP] WebSocket imports failed: {e}")
+    sys.exit(1)
+
+try:
+    import uvicorn
+    print("✅ [STARTUP] Uvicorn import successful")
+except Exception as e:
+    print(f"❌ [STARTUP] Uvicorn import failed: {e}")
+    sys.exit(1)
 
 # Add the current directory to path for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
+print(f"✅ [STARTUP] Added current directory to path: {current_dir}")
 
-# Import modified youtube demo functions
-from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData, ytdlp_manager
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ [STARTUP] dotenv loaded successfully")
+except Exception as e:
+    print(f"⚠️ [STARTUP] dotenv load warning (continuing): {e}")
+
+# Import modified youtube demo functions - this is most likely to fail
+try:
+    from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData, ytdlp_manager
+    print("✅ [STARTUP] YouTube demo imports successful")
+except Exception as e:
+    print(f"❌ [STARTUP] YouTube demo imports failed: {e}")
+    print(f"❌ [STARTUP] Available files in current directory: {list(os.listdir('.'))}")
+    sys.exit(1)
 
 load_dotenv()
 
@@ -391,7 +436,7 @@ class WebSocketPublishClient:
 # Global publisher instance
 publisher = AudioStreamPublisher()
 
-@app.post("/ingest/start", response_model=IngestStartResponse)
+@app.post("/python/ingest/start", response_model=IngestStartResponse)
 async def start_ingest(request: IngestStartRequest):
     """Start audio ingestion from YouTube to WebSocket publisher"""
     try:
@@ -432,7 +477,7 @@ async def start_ingest(request: IngestStartRequest):
         logging.error(f"Failed to start ingestion: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/ingest/stop", response_model=IngestStopResponse)
+@app.post("/python/ingest/stop", response_model=IngestStopResponse)
 async def stop_ingest(request: IngestStopRequest):
     """Stop audio ingestion session (idempotent)"""
     try:
@@ -457,12 +502,12 @@ async def stop_ingest(request: IngestStopRequest):
         logging.error(f"Failed to stop ingestion: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
+@app.get("/python/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": time.time()}
 
-@app.get("/sessions")
+@app.get("/python/sessions")
 async def get_sessions():
     """Get all active sessions"""
     return {
@@ -484,10 +529,26 @@ if __name__ == "__main__":
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    uvicorn.run(
-        "publisher:app",
-        host="0.0.0.0",
-        port=9000,
-        log_level="info",
-        reload=False
-    )
+    try:
+        host = os.getenv("HOST", "0.0.0.0")
+        port = 9000
+        
+        logging.info(f"🚀 Starting FastAPI server on {host}:{port}")
+        logging.info(f"🔧 Environment variables: HOST={os.getenv('HOST', 'not set')}")
+        logging.info(f"🔧 Current working directory: {os.getcwd()}")
+        logging.info(f"🔧 Python path: {sys.path}")
+        
+        uvicorn.run(
+            "publisher:app",
+            host=host,
+            port=port,
+            log_level="info",
+            reload=False
+        )
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to start server: {e}")
+        logging.error(f"❌ Exception type: {type(e).__name__}")
+        import traceback
+        logging.error(f"❌ Full traceback: {traceback.format_exc()}")
+        raise
