@@ -1,0 +1,10 @@
+websockets 
+protobuf
+python-dotenv
+yt-dlp
+pydub
+numpy
+fastapi
+uvicorn
+pydantic
+psutil

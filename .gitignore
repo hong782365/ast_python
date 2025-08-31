@@ -36,6 +36,7 @@ logs/
 *.log
 *.txt
 !requirements.txt
+!requirements-container.txt
 
 # 素材
 *.wav

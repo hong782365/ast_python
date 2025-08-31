@@ -8,6 +8,7 @@ import time
 import logging
 import json
 import re
+import shutil
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Union
@@ -433,7 +434,7 @@ class YtDlpManager:
             
             extract_elapsed = time.time() - extract_start_time
             logging.info(f"📡 Stream URL extracted in {extract_elapsed:.2f}s")
-            logging.info(f"📡 Stream URL: {stream_url[:100]}...")
+            logging.info(f"📡 Stream URL: {stream_url}")
             
             return stream_url
             
@@ -478,6 +479,36 @@ class YtDlpManager:
         if self._ydl:
             # yt-dlp实例通常不需要显式清理
             self._ydl = None
+
+def get_ffmpeg_path():
+    """Detect FFmpeg path based on environment"""
+    # Production paths (Cloudflare/Docker)
+    production_paths = [
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+        "/app/ffmpeg",
+        "/opt/ffmpeg/bin/ffmpeg"
+    ]
+    
+    # Local development path (macOS with Homebrew)
+    local_path = "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg"
+    
+    # First try local development path
+    if os.path.exists(local_path):
+        return local_path
+    
+    # Then try production paths
+    for path in production_paths:
+        if os.path.exists(path):
+            return path
+    
+    # Finally, try to find ffmpeg in PATH
+    ffmpeg_in_path = shutil.which("ffmpeg")
+    if ffmpeg_in_path:
+        return ffmpeg_in_path
+    
+    # If nothing found, raise an error
+    raise FileNotFoundError("FFmpeg not found. Please install FFmpeg or set the correct path.")
 
 # 全局yt-dlp管理器实例
 ytdlp_manager = YtDlpManager()
@@ -534,7 +565,7 @@ class YouTubeLiveStreamer:
             
             # Step 2: Use ffmpeg to directly pull from network with reconnect parameters
             ffmpeg_cmd = [
-                "/opt/homebrew/Caskroom/miniforge/base/bin/ffmpeg",  # ffmpeg 主程序
+                get_ffmpeg_path(),  # ffmpeg 主程序
                 "-hide_banner",  # 隐藏 ffmpeg 启动横幅信息
                 "-report",  # 它会生成一个详细的报告文件，完整记录 FFmpeg 的所有命令行输出（无论你在 -loglevel 设置了什么级别）、运行环境、库版本等信息。当你的 Python 脚本无法完全捕获实时输出时，这个报告文件就是你最终的真相来源。
                 "-loglevel", "verbose",  # verbose 恢复详细日志以诊断问题
