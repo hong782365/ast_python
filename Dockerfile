@@ -1,16 +1,9 @@
 FROM python:3.11-slim
 
-# 复制并安装静态 FFmpeg
-COPY docker-assets/ffmpeg-release-amd64-static.tar.xz /tmp/
-RUN apt-get update && apt-get install -y --no-install-recommends xz-utils && \
-    tar -xf /tmp/ffmpeg-release-amd64-static.tar.xz -C /tmp/ && \
-    cp /tmp/ffmpeg-*/ffmpeg /usr/local/bin/ && \
-    cp /tmp/ffmpeg-*/ffprobe /usr/local/bin/ && \
-    chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
-    rm -rf /tmp/ffmpeg-* /tmp/ffmpeg-release-amd64-static.tar.xz && \
-    apt-get remove -y xz-utils && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
+# 安装系统依赖包括 FFmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录
 WORKDIR /app

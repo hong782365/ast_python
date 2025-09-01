@@ -480,6 +480,44 @@ class YtDlpManager:
             # yt-dlp实例通常不需要显式清理
             self._ydl = None
 
+def is_cloudflare_environment():
+    """Detect if running in Cloudflare Containers environment"""
+    # Method 1: Check for Cloudflare-specific environment variables
+    if os.getenv("CF_PAGES") == "1":
+        return True
+    if os.getenv("CLOUDFLARE_ENVIRONMENT") == "production":
+        return True
+    if os.getenv("DEPLOY_ENV") == "cloudflare":
+        return True
+    
+    # Method 2: Check for Cloudflare container characteristics
+    if os.path.exists("/usr/local/bin/ffmpeg"):
+        return True
+    
+    # Method 3: Check if we're in a container-like environment with specific paths
+    container_indicators = [
+        "/app",  # Common container app directory
+        "/.dockerenv"  # Docker environment indicator
+    ]
+    
+    # If multiple container indicators exist, likely in Cloudflare
+    indicators_found = sum(1 for path in container_indicators if os.path.exists(path))
+    
+    # Additional heuristic: check if we're not in typical local dev paths
+    local_dev_indicators = [
+        "/Users",  # macOS
+        "/home",   # Linux home directories
+        "/opt/homebrew"  # Homebrew on macOS
+    ]
+    
+    has_local_indicators = any(os.path.exists(path) for path in local_dev_indicators)
+    
+    # If we have container indicators but no local dev indicators, likely Cloudflare
+    if indicators_found > 0 and not has_local_indicators:
+        return True
+    
+    return False
+
 def get_ffmpeg_path():
     """Detect FFmpeg path based on environment"""
     # Production paths (Cloudflare/Docker)
@@ -509,6 +547,379 @@ def get_ffmpeg_path():
     
     # If nothing found, raise an error
     raise FileNotFoundError("FFmpeg not found. Please install FFmpeg or set the correct path.")
+
+async def diagnose_ffmpeg_command(ffmpeg_args, timeout=30):
+    """
+    独立的 FFmpeg 诊断函数，用于调试线上问题
+    使用 FFREPORT + stderr=PIPE 捕获完整的 FFmpeg 日志
+    """
+    import asyncio
+    import time
+    
+    start_time = time.time()
+    result = {
+        "success": False,
+        "ffmpeg_version": None,
+        "execution_time": 0,
+        "chunks_generated": 0,
+        "stderr_log": [],
+        "report_log": [],
+        "error": None,
+        "environment": "cloudflare" if is_cloudflare_environment() else "local"
+    }
+    
+    try:
+        # 设置环境变量，让 FFmpeg report 输出到 stderr
+        env = os.environ.copy()
+        env["FFREPORT"] = "file=/dev/stderr:level=48"
+        
+        logging.info(f"🔧 DIAGNOSE: Starting FFmpeg diagnosis with command: {' '.join(ffmpeg_args)}")
+        print(f"🔧 CLOUDFLARE_DIAGNOSE: Starting FFmpeg diagnosis", file=sys.stderr, flush=True)
+        print(f"🔧 CLOUDFLARE_DIAGNOSE: Command: {' '.join(ffmpeg_args)}", file=sys.stderr, flush=True)
+        
+        # 创建进程，stdout 和 stderr 都用 PIPE 捕获
+        proc = subprocess.Popen(
+            ffmpeg_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            env=env
+        )
+        
+        # 异步读取 stderr 和 stdout
+        async def read_stderr():
+            stderr_lines = []
+            try:
+                # 使用线程池读取 stderr（因为 stderr 是阻塞的）
+                import concurrent.futures
+                loop = asyncio.get_event_loop()
+                
+                def read_stderr_blocking():
+                    lines = []
+                    try:
+                        for line in iter(proc.stderr.readline, b''):
+                            if not line:
+                                break
+                            line_str = line.decode('utf-8', errors='ignore').rstrip()
+                            lines.append(line_str)
+                            # 实时输出到 stderr 和日志
+                            logging.info(f"🔧 FFMPEG_STDERR: {line_str}")
+                            print(f"🔧 CLOUDFLARE_FFMPEG: {line_str}", file=sys.stderr, flush=True)
+                    except Exception as e:
+                        logging.error(f"🔧 DIAGNOSE: Error reading stderr: {e}")
+                    return lines
+                
+                stderr_lines = await loop.run_in_executor(None, read_stderr_blocking)
+            except Exception as e:
+                logging.error(f"🔧 DIAGNOSE: Error in stderr reader: {e}")
+                stderr_lines.append(f"Error reading stderr: {e}")
+            
+            return stderr_lines
+        
+        async def read_stdout():
+            stdout_chunks = 0
+            try:
+                loop = asyncio.get_event_loop()
+                
+                def read_stdout_blocking():
+                    chunks = 0
+                    try:
+                        while True:
+                            chunk = proc.stdout.read(640)  # 读取 640 字节 PCM 数据
+                            if not chunk:
+                                break
+                            chunks += 1
+                            if chunks <= 5:  # 只记录前5个chunk
+                                logging.info(f"🔧 DIAGNOSE: Received stdout chunk {chunks}: {len(chunk)} bytes")
+                                print(f"🔧 CLOUDFLARE_DIAGNOSE: Received stdout chunk {chunks}: {len(chunk)} bytes", file=sys.stderr, flush=True)
+                                
+                            # For diagnostic commands like -version, don't read too much
+                            if chunks >= 100:  # Limit to prevent hanging
+                                break
+                    except Exception as e:
+                        logging.error(f"🔧 DIAGNOSE: Error reading stdout: {e}")
+                    return chunks
+                
+                stdout_chunks = await loop.run_in_executor(None, read_stdout_blocking)
+            except Exception as e:
+                logging.error(f"🔧 DIAGNOSE: Error in stdout reader: {e}")
+            
+            return stdout_chunks
+        
+        # 等待进程完成或超时
+        try:
+            stderr_task = asyncio.create_task(read_stderr())
+            stdout_task = asyncio.create_task(read_stdout())
+            
+            # 等待超时或进程完成
+            done, pending = await asyncio.wait(
+                [stderr_task, stdout_task],
+                timeout=timeout,
+                return_when=asyncio.ALL_COMPLETED
+            )
+            
+            # Check if we timed out
+            if pending:
+                # We timed out, cancel pending tasks
+                for task in pending:
+                    task.cancel()
+                raise asyncio.TimeoutError()
+            
+            stderr_lines = await stderr_task
+            chunks_count = await stdout_task
+            
+            # 等待进程结束
+            proc.wait()
+            
+        except asyncio.TimeoutError:
+            logging.warning(f"🔧 DIAGNOSE: FFmpeg diagnosis timed out after {timeout}s")
+            print(f"🔧 CLOUDFLARE_DIAGNOSE: FFmpeg diagnosis timed out after {timeout}s", file=sys.stderr, flush=True)
+            proc.kill()
+            proc.wait()
+            
+            stderr_lines = []
+            chunks_count = 0
+            result["error"] = f"Timeout after {timeout} seconds"
+        
+        # 处理结果
+        execution_time = time.time() - start_time
+        result["execution_time"] = execution_time
+        result["chunks_generated"] = chunks_count
+        result["stderr_log"] = stderr_lines
+        
+        # 解析 FFmpeg 版本信息
+        for line in stderr_lines:
+            if "ffmpeg version" in line.lower():
+                result["ffmpeg_version"] = line
+                break
+        
+        # 判断成功/失败
+        return_code = proc.returncode
+        if return_code == 0:
+            result["success"] = True
+            logging.info(f"🔧 DIAGNOSE: FFmpeg diagnosis completed successfully")
+            print(f"🔧 CLOUDFLARE_DIAGNOSE: FFmpeg diagnosis completed successfully - Chunks: {chunks_count}, Time: {execution_time:.2f}s", file=sys.stderr, flush=True)
+        else:
+            result["error"] = f"FFmpeg exited with code {return_code}"
+            logging.error(f"🔧 DIAGNOSE: FFmpeg diagnosis failed with exit code: {return_code}")
+            print(f"🔧 CLOUDFLARE_DIAGNOSE: FFmpeg diagnosis failed - Exit code: {return_code}, Chunks: {chunks_count}, Time: {execution_time:.2f}s", file=sys.stderr, flush=True)
+        
+        # 分析关键问题
+        analysis = []
+        for line in stderr_lines:
+            line_lower = line.lower()
+            if any(keyword in line_lower for keyword in ["error", "failed", "timeout", "connection", "refused", "unavailable"]):
+                analysis.append(line)
+        
+        if analysis:
+            result["key_issues"] = analysis
+            print(f"🔧 CLOUDFLARE_DIAGNOSE: Key issues found: {len(analysis)}", file=sys.stderr, flush=True)
+            for issue in analysis[:3]:  # 只输出前3个关键问题
+                print(f"🔧 CLOUDFLARE_ISSUE: {issue}", file=sys.stderr, flush=True)
+        
+    except Exception as e:
+        result["error"] = f"Diagnosis failed: {str(e)}"
+        result["execution_time"] = time.time() - start_time
+        logging.error(f"🔧 DIAGNOSE: Diagnosis exception: {e}")
+        print(f"🔧 CLOUDFLARE_ERROR: Diagnosis exception - {e}", file=sys.stderr, flush=True)
+        import traceback
+        logging.error(f"🔧 DIAGNOSE: Traceback: {traceback.format_exc()}")
+    
+    return result
+
+async def comprehensive_ffmpeg_diagnosis(timeout_per_test=10):
+    """
+    综合 FFmpeg 诊断，运行所有预设的测试用例
+    """
+    import asyncio
+    import time
+    
+    ffmpeg_path = get_ffmpeg_path()
+    is_cloudflare = is_cloudflare_environment()
+    
+    diagnosis_result = {
+        "environment": "cloudflare" if is_cloudflare else "local",
+        "ffmpeg_path": ffmpeg_path,
+        "total_execution_time": 0,
+        "tests": [],
+        "summary": {
+            "total_tests": 0,
+            "passed": 0,
+            "failed": 0,
+            "crashed": 0
+        }
+    }
+    
+    start_time = time.time()
+    
+    # 定义测试用例
+    test_cases = [
+        {
+            "name": "version_check",
+            "description": "FFmpeg 版本信息",
+            "command": [ffmpeg_path, "-version"],
+            "expected_chunks": 0,
+            "timeout": 5
+        },
+        {
+            "name": "protocols_check", 
+            "description": "支持的协议列表",
+            "command": [ffmpeg_path, "-protocols"],
+            "expected_chunks": 0,
+            "timeout": 5
+        },
+        {
+            "name": "demuxers_check",
+            "description": "支持的解封装器",
+            "command": [ffmpeg_path, "-demuxers"],
+            "expected_chunks": 0,
+            "timeout": 5
+        },
+        {
+            "name": "sine_wave_test",
+            "description": "合成正弦波音频（无网络）",
+            "command": [ffmpeg_path, "-f", "lavfi", "-i", "sine=frequency=1000:duration=3", 
+                       "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-f", "s16le", "-y", "pipe:1"],
+            "expected_chunks": 240,  # 3秒 * 16000/640 ≈ 75 chunks
+            "timeout": 8
+        },
+        {
+            "name": "simple_http_test",
+            "description": "简单 HTTP 音频文件 test",
+            "command": [ffmpeg_path, "-i", "https://www.wavsource.com/snds_2020-10-01_3728627494378403/sfx/come_get_it.wav",
+                       "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-f", "s16le", "-t", "3", "-y", "pipe:1"],
+            "expected_chunks": 75,
+            "timeout": 15
+        },
+        {
+            "name": "youtube_hls_test",
+            "description": "你的问题 YouTube HLS 流",
+            "command": [ffmpeg_path, "-hide_banner", "-report", "-loglevel", "verbose", "-fflags", "nobuffer",
+                       "-i", "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1756714624/ei/IAK1aP7wOOjmxN8Ph9vfwQM/ip/104.28.155.125/id/t6_BU_GrG7w.1/itag/91/source/yt_live_broadcast/requiressl/yes/ratebypass/yes/live/1/sgoap/gir%3Dyes%3Bitag%3D139/sgovp/gir%3Dyes%3Bitag%3D160/rqh/1/hls_chunk_host/rr5---sn-apn7en7l.googlevideo.com/xpc/EgVo2aDSNQ%3D%3D/playlist_duration/30/manifest_duration/30/ss/1/siu/1/bui/AY1jyLO1pebu2ik37KZ_xQXU5AwGiM0qHPqOJhH1SIwv882RMg1CcYvxldNIGdIZS1LloG1M5Q/spc/l3OVKf8khKw0XTSDuHBDiWZGDlBvzq_mMyeKSokic8dBzZwkcyg-qhn1LuDMtOLWkbL1XycVO5TFX852GJwP__VJCy_qsC9JFjRu9KcZOINIL8I/vprv/1/playlist_type/DVR/initcwndbps/2377500/met/1756693025,/mh/f_/mm/44/mn/sn-apn7en7l/ms/lva/mv/m/mvi/5/pl/24/rms/lva,lva/dover/11/pacing/0/keepalive/yes/fexp/51355912,51552689,51565116,51565681,51580968/mt/1756692509/sparams/expire,ei,ip,id,itag,source,requiressl,ratebypass,live,sgoap,sgovp,rqh,xpc,playlist_duration,manifest_duration,ss,siu,bui,spc,vprv,playlist_type/sig/AJfQdSswRAIgYuUoNhYESqPvI0hz94nk7MMVfvHZh7dbO-SdSOaCYFACICP2H73dbuwjalCKmwIRuztmGUgUaTub-8zxNXg-DlJA/lsparams/hls_chunk_host,initcwndbps,met,mh,mm,mn,ms,mv,mvi,pl,rms/lsig/APaTxxMwRgIhAKY_C5sPwioUWII4Lx6mzr1X_Vcc0VqKAGFJdwEEb8uaAiEAhbj6Pu3tEn0sizUWxzz1foW-x0fD_7-aB5qA0rn-W_s%3D/playlist/index.m3u8",
+                       "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le", "-f", "s16le", "-t", "5", "-y", "pipe:1"],
+            "expected_chunks": 125,  # 5秒
+            "timeout": 20
+        }
+    ]
+    
+    print(f"🔧 CLOUDFLARE_COMPREHENSIVE: Starting comprehensive FFmpeg diagnosis - {len(test_cases)} tests", file=sys.stderr, flush=True)
+    
+    # 逐个运行测试
+    for i, test_case in enumerate(test_cases):
+        test_start_time = time.time()
+        test_result = {
+            "name": test_case["name"],
+            "description": test_case["description"],
+            "success": False,
+            "execution_time": 0,
+            "chunks_generated": 0,
+            "error": None,
+            "status": "unknown",
+            "stderr_summary": []
+        }
+        
+        diagnosis_result["tests"].append(test_result)
+        diagnosis_result["summary"]["total_tests"] += 1
+        
+        try:
+            print(f"🔧 CLOUDFLARE_TEST[{i+1}/{len(test_cases)}]: {test_case['name']} - {test_case['description']}", file=sys.stderr, flush=True)
+            
+            # 运行单个测试
+            result = await diagnose_ffmpeg_command(test_case["command"], timeout=test_case["timeout"])
+            
+            test_result["success"] = result["success"]
+            test_result["execution_time"] = result["execution_time"]
+            test_result["chunks_generated"] = result["chunks_generated"]
+            test_result["error"] = result["error"]
+            
+            # 提取关键 stderr 信息
+            if result["stderr_log"]:
+                test_result["stderr_summary"] = result["stderr_log"][:5]  # 前5行
+            
+            # 分析测试状态
+            if result["success"]:
+                if test_case["name"] in ["version_check", "protocols_check", "demuxers_check"]:
+                    # 信息查询类测试，成功即通过
+                    test_result["status"] = "passed"
+                    diagnosis_result["summary"]["passed"] += 1
+                elif result["chunks_generated"] > 0:
+                    # 音频生成类测试，需要有音频输出
+                    test_result["status"] = "passed"
+                    diagnosis_result["summary"]["passed"] += 1
+                else:
+                    # 成功但没有音频输出
+                    test_result["status"] = "no_audio"
+                    diagnosis_result["summary"]["failed"] += 1
+            else:
+                # 检查是否是崩溃
+                if result["error"] and "code -11" in result["error"]:
+                    test_result["status"] = "crashed"
+                    diagnosis_result["summary"]["crashed"] += 1
+                else:
+                    test_result["status"] = "failed"
+                    diagnosis_result["summary"]["failed"] += 1
+            
+            print(f"🔧 CLOUDFLARE_TEST_RESULT[{i+1}]: {test_case['name']} - {test_result['status']} - Chunks: {result['chunks_generated']}, Time: {result['execution_time']:.2f}s", file=sys.stderr, flush=True)
+            
+            # 如果是崩溃测试，后续测试可能也会崩溃，但我们继续测试以获得完整信息
+            if test_result["status"] == "crashed":
+                print(f"🔧 CLOUDFLARE_WARNING: Test {test_case['name']} crashed with SIGSEGV, continuing with other tests", file=sys.stderr, flush=True)
+                
+        except Exception as e:
+            test_result["error"] = f"Test execution failed: {str(e)}"
+            test_result["status"] = "exception" 
+            diagnosis_result["summary"]["failed"] += 1
+            print(f"🔧 CLOUDFLARE_TEST_ERROR[{i+1}]: {test_case['name']} - Exception: {e}", file=sys.stderr, flush=True)
+    
+    diagnosis_result["total_execution_time"] = time.time() - start_time
+    
+    # 生成综合分析
+    analysis = []
+    
+    # FFmpeg 基础功能分析
+    version_test = next((t for t in diagnosis_result["tests"] if t["name"] == "version_check"), None)
+    if version_test and version_test["status"] == "passed":
+        analysis.append("✅ FFmpeg 基础功能正常")
+    else:
+        analysis.append("❌ FFmpeg 基础功能异常")
+    
+    # 网络功能分析
+    http_test = next((t for t in diagnosis_result["tests"] if t["name"] == "simple_http_test"), None)
+    if http_test and http_test["status"] == "passed":
+        analysis.append("✅ HTTP 网络功能正常")
+    elif http_test and http_test["status"] == "crashed":
+        analysis.append("❌ HTTP 网络访问导致崩溃")
+    else:
+        analysis.append("⚠️  HTTP 网络功能异常")
+    
+    # HLS 功能分析
+    hls_test = next((t for t in diagnosis_result["tests"] if t["name"] == "youtube_hls_test"), None)
+    if hls_test and hls_test["status"] == "passed":
+        analysis.append("✅ YouTube HLS 流处理正常")
+    elif hls_test and hls_test["status"] == "crashed":
+        analysis.append("🔴 YouTube HLS 流导致 FFmpeg 崩溃 (SIGSEGV)")
+    else:
+        analysis.append("❌ YouTube HLS 流处理失败")
+    
+    # 音频处理分析
+    sine_test = next((t for t in diagnosis_result["tests"] if t["name"] == "sine_wave_test"), None)
+    if sine_test and sine_test["status"] == "passed":
+        analysis.append("✅ 音频编码处理正常")
+    else:
+        analysis.append("❌ 音频编码处理异常")
+    
+    diagnosis_result["analysis"] = analysis
+    
+    # 添加与测试脚本兼容的字段
+    diagnosis_result["total_tests"] = diagnosis_result["summary"]["total_tests"]
+    diagnosis_result["passed_tests"] = diagnosis_result["summary"]["passed"] 
+    diagnosis_result["failed_tests"] = diagnosis_result["summary"]["failed"] + diagnosis_result["summary"]["crashed"]
+    diagnosis_result["success_rate"] = diagnosis_result["summary"]["passed"] / max(diagnosis_result["summary"]["total_tests"], 1)
+    diagnosis_result["test_results"] = diagnosis_result["tests"]
+    
+    print(f"🔧 CLOUDFLARE_COMPREHENSIVE: Diagnosis completed - {diagnosis_result['summary']['passed']} passed, {diagnosis_result['summary']['failed']} failed, {diagnosis_result['summary']['crashed']} crashed", file=sys.stderr, flush=True)
+    
+    return diagnosis_result
 
 # 全局yt-dlp管理器实例
 ytdlp_manager = YtDlpManager()
@@ -554,20 +965,36 @@ class YouTubeLiveStreamer:
     async def start_streaming_pipeline(self):
         """Start yt-dlp (library mode) + ffmpeg (direct network pull) pipeline for PCM streaming"""
         timestamp = time.strftime("%Y%m%dT%H%M%SZ")
+        is_cloudflare = is_cloudflare_environment()
         
-        # Create ffmpeg log file paths
-        ffmpeg_report_log = self.ffmpeg_report_dir / f"ffmpeg-report-{timestamp}-{self.youtube_url_id}.log"
-        ffmpeg_console_log = self.ffmpeg_log_dir / f"ffmpeg-console-{timestamp}-{self.youtube_url_id}.log"
+        # Environment-specific logging setup
+        if is_cloudflare:
+            # Cloudflare: No file logs, direct stderr output
+            ffmpeg_report_log = None
+            ffmpeg_console_log = None
+            logging.info(f"🌐 Running in Cloudflare environment - using direct stderr logging")
+        else:
+            # Local: File-based logging (existing behavior)
+            ffmpeg_report_log = self.ffmpeg_report_dir / f"ffmpeg-report-{timestamp}-{self.youtube_url_id}.log"
+            ffmpeg_console_log = self.ffmpeg_log_dir / f"ffmpeg-console-{timestamp}-{self.youtube_url_id}.log"
+            logging.info(f"🏠 Running in local environment - using file-based logging")
         
         try:
             # Step 1: Use yt-dlp library to extract direct stream URL
             direct_url = await ytdlp_manager.extract_stream_url(self.youtube_url)
             
-            # Step 2: Use ffmpeg to directly pull from network with reconnect parameters
+            # Step 2: Build ffmpeg command based on environment
             ffmpeg_cmd = [
                 get_ffmpeg_path(),  # ffmpeg 主程序
                 "-hide_banner",  # 隐藏 ffmpeg 启动横幅信息
-                "-report",  # 它会生成一个详细的报告文件，完整记录 FFmpeg 的所有命令行输出（无论你在 -loglevel 设置了什么级别）、运行环境、库版本等信息。当你的 Python 脚本无法完全捕获实时输出时，这个报告文件就是你最终的真相来源。
+            ]
+            
+            # Add report parameter only for local environment
+            if not is_cloudflare:
+                ffmpeg_cmd.append("-report")  # 它会生成一个详细的报告文件，完整记录 FFmpeg 的所有命令行输出（无论你在 -loglevel 设置了什么级别）、运行环境、库版本等信息。当你的 Python 脚本无法完全捕获实时输出时，这个报告文件就是你最终的真相来源。
+            
+            # Add remaining ffmpeg parameters
+            ffmpeg_cmd.extend([
                 "-loglevel", "verbose",  # verbose 恢复详细日志以诊断问题
 
                 # --- ↓↓↓ 超低延迟优化参数 ↓↓↓ ---
@@ -588,29 +1015,49 @@ class YouTubeLiveStreamer:
                 "-t", str(self.duration_seconds),  # 限制处理时长（秒）
                 "-y",  # 覆盖输出文件（如果存在）
                 "pipe:1"  # 输出到 stdout 标准输出（管道）
-            ]
+            ])
             
             # Start ffmpeg process directly with network stream
             logging.info("Starting ffmpeg with direct network stream...")
             logging.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
-            logging.info(f"FFmpeg report log: {ffmpeg_report_log}")
-            logging.info(f"FFmpeg console log: {ffmpeg_console_log}")
             
-            # Set up environment for ffmpeg report output
+            if is_cloudflare:
+                logging.info("🌐 Cloudflare mode: FFmpeg stderr will output directly to console")
+                print(f"🚀 CLOUDFLARE_LOG: Starting FFmpeg with direct stderr output", file=sys.stderr, flush=True)
+                print(f"🚀 CLOUDFLARE_LOG: FFmpeg command: {' '.join(ffmpeg_cmd)}", file=sys.stderr, flush=True)
+            else:
+                logging.info(f"🏠 Local mode: FFmpeg logs to files")
+                logging.info(f"FFmpeg report log: {ffmpeg_report_log}")
+                logging.info(f"FFmpeg console log: {ffmpeg_console_log}")
+                print(f"🚀 CLOUDFLARE_LOG: FFmpeg report log: {ffmpeg_report_log}", file=sys.stderr, flush=True)
+                print(f"🚀 CLOUDFLARE_LOG: FFmpeg console log: {ffmpeg_console_log}", file=sys.stderr, flush=True)
+            
+            # Set up environment and file handles based on environment
             ffmpeg_start_time = time.time()
             ffmpeg_env = os.environ.copy()
-            ffmpeg_env['FFREPORT'] = f"file={ffmpeg_report_log}:level=48"
+            ffmpeg_console_file = None
             
-            # Open console log file for stderr redirection
-            ffmpeg_console_file = open(ffmpeg_console_log, 'w')
-            
-            self.ffmpeg_process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=ffmpeg_console_file,
-                bufsize=0,
-                env=ffmpeg_env
-            )
+            if is_cloudflare:
+                # Cloudflare: Direct stderr output, no file redirection
+                self.ffmpeg_process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=sys.stderr,  # FFmpeg stderr goes directly to Python's stderr
+                    bufsize=0,
+                    env=ffmpeg_env
+                )
+            else:
+                # Local: File-based logging (existing behavior)
+                ffmpeg_env['FFREPORT'] = f"file={ffmpeg_report_log}:level=48"
+                ffmpeg_console_file = open(ffmpeg_console_log, 'w')
+                
+                self.ffmpeg_process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=ffmpeg_console_file,
+                    bufsize=0,
+                    env=ffmpeg_env
+                )
             
             # Store the file handle for cleanup
             self.ffmpeg_console_file = ffmpeg_console_file
@@ -626,30 +1073,53 @@ class YouTubeLiveStreamer:
             if self.ffmpeg_process.poll() is not None:
                 # ffmpeg process has already exited
                 logging.error(f"FFmpeg process exited early with code: {self.ffmpeg_process.returncode}")
-                logging.error(f"FFmpeg console log: {ffmpeg_console_log}")
-                # Try to read the console log file for error details
-                try:
-                    with open(ffmpeg_console_log, 'r') as f:
-                        stderr_content = f.read()
-                        if stderr_content.strip():
-                            logging.error(f"FFmpeg stderr from log file: {stderr_content}")
-                except Exception as e:
-                    logging.error(f"Could not read ffmpeg console log: {e}")
-                raise Exception(f"FFmpeg failed to start, check log file: {ffmpeg_console_log}")
+                
+                # Output critical startup failure to stderr
+                print(f"🔴 CLOUDFLARE_ERROR: FFmpeg startup failed - Exit code: {self.ffmpeg_process.returncode}", file=sys.stderr, flush=True)
+                
+                if is_cloudflare:
+                    # Cloudflare: stderr already went directly to console
+                    logging.error("🌐 FFmpeg stderr should be visible above (direct output)")
+                    print(f"🔴 CLOUDFLARE_ERROR: FFmpeg stderr should be visible above (direct output)", file=sys.stderr, flush=True)
+                    raise Exception(f"FFmpeg failed to start in Cloudflare environment, exit code: {self.ffmpeg_process.returncode}")
+                else:
+                    # Local: Try to read console log file
+                    logging.error(f"FFmpeg console log: {ffmpeg_console_log}")
+                    print(f"🔴 CLOUDFLARE_ERROR: Check FFmpeg console log: {ffmpeg_console_log}", file=sys.stderr, flush=True)
+                    
+                    try:
+                        with open(ffmpeg_console_log, 'r') as f:
+                            stderr_content = f.read()
+                            if stderr_content.strip():
+                                logging.error(f"FFmpeg stderr from log file: {stderr_content}")
+                                # Output first 200 chars of error to stderr for immediate visibility
+                                print(f"🔴 CLOUDFLARE_ERROR: FFmpeg startup stderr - {stderr_content[:200]}...", file=sys.stderr, flush=True)
+                    except Exception as e:
+                        logging.error(f"Could not read ffmpeg console log: {e}")
+                        print(f"🔴 CLOUDFLARE_ERROR: Could not read FFmpeg console log - {e}", file=sys.stderr, flush=True)
+                    
+                    raise Exception(f"FFmpeg failed to start, check log file: {ffmpeg_console_log}")
             
             logging.info(f"FFmpeg process spawned successfully (PID: {self.ffmpeg_process.pid})")
+            print(f"✅ CLOUDFLARE_LOG: FFmpeg process spawned successfully - PID: {self.ffmpeg_process.pid}", file=sys.stderr, flush=True)
             
-            # Start a background task to monitor ffmpeg console log
-            stderr_monitor_task = asyncio.create_task(self._monitor_ffmpeg_stderr(ffmpeg_console_log))
-            
-            # Start a background task to monitor ffmpeg health
-            health_monitor_task = asyncio.create_task(self._monitor_ffmpeg_health())
+            # Start background monitoring tasks based on environment
+            if is_cloudflare:
+                # Cloudflare: Only health monitoring (no file monitoring needed)
+                logging.info("🌐 Cloudflare mode: Starting health monitor only")
+                health_monitor_task = asyncio.create_task(self._monitor_ffmpeg_health())
+            else:
+                # Local: Both file monitoring and health monitoring
+                logging.info("🏠 Local mode: Starting file and health monitors")
+                stderr_monitor_task = asyncio.create_task(self._monitor_ffmpeg_stderr(ffmpeg_console_log))
+                health_monitor_task = asyncio.create_task(self._monitor_ffmpeg_health())
             
             logging.info(f"Started direct network streaming pipeline using yt-dlp library")
             return self.ffmpeg_process.stdout
             
         except Exception as e:
             logging.error(f"Failed to start streaming pipeline: {e}")
+            print(f"🔴 CLOUDFLARE_ERROR: Failed to start streaming pipeline - {e}", file=sys.stderr, flush=True)
             await self.cleanup()
             raise
     
@@ -657,14 +1127,18 @@ class YouTubeLiveStreamer:
         """Monitor ffmpeg console log file in the background"""
         if not self.ffmpeg_process:
             logging.warning("🔧 FFmpeg stderr monitor: No process available")
+            print("🔧 FFmpeg stderr monitor: No process available", file=sys.stderr, flush=True)
             return
             
         logging.info(f"🔧 Starting FFmpeg console log monitor for PID {self.ffmpeg_process.pid}")
         logging.info(f"🔧 Monitoring log file: {console_log_path}")
+        print(f"🔧 CLOUDFLARE_LOG: FFmpeg console monitor started - PID {self.ffmpeg_process.pid}", file=sys.stderr, flush=True)
         
         try:
             line_count = 0
             last_position = 0
+            error_count = 0
+            warning_count = 0
             
             while self.ffmpeg_process.poll() is None:
                 try:
@@ -681,11 +1155,20 @@ class YouTubeLiveStreamer:
                                     line_count += 1
                                     # Categorize different types of FFmpeg messages
                                     if "error" in line_str.lower() or "failed" in line_str.lower():
+                                        error_count += 1
                                         logging.error(f"🔴 FFmpeg ERROR: {line_str}")
+                                        # Output critical errors to stderr for Cloudflare Workers Logs
+                                        print(f"🔴 CLOUDFLARE_ERROR: FFmpeg - {line_str}", file=sys.stderr, flush=True)
                                     elif "warning" in line_str.lower():
+                                        warning_count += 1
                                         logging.warning(f"🟡 FFmpeg WARNING: {line_str}")
+                                        # Output warnings to stderr for visibility
+                                        print(f"🟡 CLOUDFLARE_WARNING: FFmpeg - {line_str}", file=sys.stderr, flush=True)
                                     elif "connection" in line_str.lower() or "http" in line_str.lower():
                                         logging.info(f"🌐 FFmpeg NETWORK: {line_str}")
+                                        # Output network issues to stderr as they're critical for debugging
+                                        if any(keyword in line_str.lower() for keyword in ["timeout", "refused", "unreachable", "failed"]):
+                                            print(f"🌐 CLOUDFLARE_NETWORK: FFmpeg - {line_str}", file=sys.stderr, flush=True)
                                     elif any(keyword in line_str.lower() for keyword in ["duration", "time=", "bitrate", "fps"]):
                                         logging.debug(f"📊 FFmpeg PROGRESS: {line_str}")
                                     else:
@@ -696,11 +1179,15 @@ class YouTubeLiveStreamer:
                     
                 except Exception as e:
                     logging.error(f"🔧 Error reading ffmpeg console log: {e}")
+                    print(f"🔧 CLOUDFLARE_ERROR: Error reading FFmpeg log - {e}", file=sys.stderr, flush=True)
                     await asyncio.sleep(2.0)  # Wait longer on error
             
             # Process has exited, read any remaining log content
             final_exit_code = self.ffmpeg_process.returncode
             logging.info(f"🔧 FFmpeg process exited with code: {final_exit_code}, total log lines processed: {line_count}")
+            
+            # Output exit status to stderr for Cloudflare Workers Logs
+            print(f"🔧 CLOUDFLARE_LOG: FFmpeg exited - Code: {final_exit_code}, Lines: {line_count}, Errors: {error_count}, Warnings: {warning_count}", file=sys.stderr, flush=True)
             
             # Read any final content from the log file
             try:
@@ -710,24 +1197,33 @@ class YouTubeLiveStreamer:
                         remaining_content = f.read()
                         if remaining_content.strip():
                             logging.info(f"🔧 Final FFmpeg log content: {remaining_content}")
+                            # Output final content if it contains errors
+                            if any(keyword in remaining_content.lower() for keyword in ["error", "failed", "timeout"]):
+                                print(f"🔧 CLOUDFLARE_FINAL: FFmpeg final output - {remaining_content[:200]}...", file=sys.stderr, flush=True)
             except Exception as e:
                 logging.error(f"🔧 Error reading final log content: {e}")
+                print(f"🔧 CLOUDFLARE_ERROR: Error reading final log - {e}", file=sys.stderr, flush=True)
                 
         except Exception as e:
             logging.error(f"🔧 FFmpeg console log monitor error: {e}")
+            print(f"🔧 CLOUDFLARE_ERROR: FFmpeg monitor exception - {e}", file=sys.stderr, flush=True)
             import traceback
             logging.error(f"🔧 Monitor traceback: {traceback.format_exc()}")
         
         logging.info("🔧 FFmpeg console log monitor ended")
+        print("🔧 CLOUDFLARE_LOG: FFmpeg console monitor ended", file=sys.stderr, flush=True)
 
     async def _monitor_ffmpeg_health(self):
         """Monitor FFmpeg process health and network connectivity"""
         if not self.ffmpeg_process:
             logging.warning("💓 FFmpeg health monitor: No process available")
+            print("💓 CLOUDFLARE_WARNING: FFmpeg health monitor - No process available", file=sys.stderr, flush=True)
             return
             
         logging.info(f"💓 Starting FFmpeg health monitor for PID {self.ffmpeg_process.pid}")
         logging.info(f"💓 FFmpeg duration limit: {self.duration_seconds} seconds")
+        print(f"💓 CLOUDFLARE_LOG: FFmpeg health monitor started - PID {self.ffmpeg_process.pid}, Duration limit: {self.duration_seconds}s", file=sys.stderr, flush=True)
+        
         check_count = 0
         start_time = time.time()
         
@@ -743,10 +1239,18 @@ class YouTubeLiveStreamer:
                     cpu_percent = process.cpu_percent()
                     memory_info = process.memory_info()
                     logging.info(f"💓 FFmpeg health check #{check_count}: CPU {cpu_percent:.1f}%, Memory {memory_info.rss/1024/1024:.1f}MB")
+                    
+                    # Output health status to stderr for monitoring (every 5 checks = 2.5 minutes)
+                    if check_count % 5 == 0:
+                        print(f"💓 CLOUDFLARE_LOG: FFmpeg health #{check_count} - CPU {cpu_percent:.1f}%, Memory {memory_info.rss/1024/1024:.1f}MB, Runtime {time.time() - start_time:.0f}s", file=sys.stderr, flush=True)
+                        
                 except ImportError:
                     logging.info(f"💓 FFmpeg health check #{check_count}: Process alive (psutil not available for detailed stats)")
+                    if check_count % 5 == 0:
+                        print(f"💓 CLOUDFLARE_LOG: FFmpeg health #{check_count} - Process alive, Runtime {time.time() - start_time:.0f}s", file=sys.stderr, flush=True)
                 except Exception as e:
                     logging.warning(f"💓 FFmpeg health check #{check_count}: Error getting process stats: {e}")
+                    print(f"💓 CLOUDFLARE_WARNING: FFmpeg health check #{check_count} error - {e}", file=sys.stderr, flush=True)
             
             # Process has exited
             exit_code = self.ffmpeg_process.returncode
@@ -755,23 +1259,34 @@ class YouTubeLiveStreamer:
             logging.info(f"💓 Total runtime: {elapsed_time:.1f}s (limit was {self.duration_seconds}s)")
             
             # Check if FFmpeg reached its duration limit
-            if abs(elapsed_time - self.duration_seconds) < 5.0:  # Within 5 seconds of limit
+            duration_reached = abs(elapsed_time - self.duration_seconds) < 5.0  # Within 5 seconds of limit
+            if duration_reached:
                 logging.info(f"💓 FFmpeg likely exited due to reaching duration limit ({self.duration_seconds}s)")
             
             # Provide interpretation of common exit codes
+            exit_interpretation = ""
             if exit_code == 0:
                 logging.info("💓 Exit code 0: Normal termination")
+                exit_interpretation = "Normal termination"
             elif exit_code == 1:
                 logging.warning("💓 Exit code 1: Generic error (check FFmpeg stderr for details)")
+                exit_interpretation = "Generic error"
             elif exit_code == -9:
                 logging.error("💓 Exit code -9: Process was killed (SIGKILL)")
+                exit_interpretation = "Process killed (SIGKILL)"
             elif exit_code == -15:
                 logging.warning("💓 Exit code -15: Process was terminated (SIGTERM)")
+                exit_interpretation = "Process terminated (SIGTERM)"
             else:
                 logging.warning(f"💓 Exit code {exit_code}: Check FFmpeg documentation for details")
+                exit_interpretation = f"Unknown exit code {exit_code}"
+            
+            # Output comprehensive exit status to stderr
+            print(f"💓 CLOUDFLARE_LOG: FFmpeg health monitor ended - Exit code: {exit_code} ({exit_interpretation}), Runtime: {elapsed_time:.1f}s/{self.duration_seconds}s, Health checks: {check_count}, Duration reached: {duration_reached}", file=sys.stderr, flush=True)
                 
         except Exception as e:
             logging.error(f"💓 FFmpeg health monitor error: {e}")
+            print(f"💓 CLOUDFLARE_ERROR: FFmpeg health monitor exception - {e}", file=sys.stderr, flush=True)
             import traceback
             logging.error(f"💓 Health monitor traceback: {traceback.format_exc()}")
         
@@ -1091,16 +1606,21 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                     if ffmpeg_process.poll() is not None:
                         logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: FFmpeg process exited (code: {ffmpeg_process.returncode})")
                         logging.error(f"⏰ Check FFmpeg console log file for error details")
+                        print(f"⏰ CLOUDFLARE_ERROR: PCM read timeout - FFmpeg exited with code {ffmpeg_process.returncode}", file=sys.stderr, flush=True)
                     else:
                         logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: FFmpeg still running (PID: {ffmpeg_process.pid})")
                         logging.error(f"⏰ This suggests the stream ended or FFmpeg is blocked")
+                        print(f"⏰ CLOUDFLARE_ERROR: PCM read timeout - FFmpeg blocked/stuck (PID: {ffmpeg_process.pid})", file=sys.stderr, flush=True)
                 else:
                     logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: No FFmpeg process reference")
+                    print(f"⏰ CLOUDFLARE_ERROR: PCM read timeout - No FFmpeg process reference", file=sys.stderr, flush=True)
                 
                 if chunk_count == 0:
                     logging.error("🔴 Timeout waiting for first PCM chunk - ffmpeg may be stuck or stream unavailable")
+                    print("🔴 CLOUDFLARE_ERROR: Timeout waiting for first PCM chunk - Stream unavailable or FFmpeg stuck", file=sys.stderr, flush=True)
                 else:
                     logging.error(f"🔴 Timeout reading PCM chunk {chunk_count + 1} - stream may have ended")
+                    print(f"🔴 CLOUDFLARE_ERROR: Timeout reading PCM chunk {chunk_count + 1} - Stream may have ended", file=sys.stderr, flush=True)
                 break
             
             if not chunk:
@@ -1123,8 +1643,11 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                 if ffmpeg_spawn_time is not None:
                     ffmpeg_startup_duration = first_pcm_time - ffmpeg_spawn_time
                     logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes, ffmpeg启动耗时: {ffmpeg_startup_duration:.2f}s")
+                    # Output critical first chunk timing to stderr for performance monitoring
+                    print(f"🎵 CLOUDFLARE_LOG: First PCM chunk received - Size: {len(chunk)} bytes, FFmpeg startup time: {ffmpeg_startup_duration:.2f}s", file=sys.stderr, flush=True)
                 else:
                     logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes")
+                    print(f"🎵 CLOUDFLARE_LOG: First PCM chunk received - Size: {len(chunk)} bytes", file=sys.stderr, flush=True)
                 
                 # Signal that audio is ready
                 if audio_ready_event:
@@ -1142,6 +1665,7 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
             
         except Exception as e:
             logging.error(f"❌ Error reading PCM chunk {chunk_count}: {e}")
+            print(f"❌ CLOUDFLARE_ERROR: Error reading PCM chunk {chunk_count} - {e}", file=sys.stderr, flush=True)
             import traceback
             logging.error(f"❌ PCM read traceback: {traceback.format_exc()}")
             
@@ -1150,16 +1674,22 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                 if ffmpeg_process.poll() is not None:
                     logging.error(f"❌ FFmpeg process status on error: exited with code {ffmpeg_process.returncode}")
                     logging.error(f"❌ Check FFmpeg console log file for error details")
+                    print(f"❌ CLOUDFLARE_ERROR: FFmpeg exited on PCM read error - Code: {ffmpeg_process.returncode}", file=sys.stderr, flush=True)
                 else:
                     logging.error(f"❌ FFmpeg process status on error: still running (PID: {ffmpeg_process.pid})")
+                    print(f"❌ CLOUDFLARE_ERROR: FFmpeg still running on PCM read error - PID: {ffmpeg_process.pid}", file=sys.stderr, flush=True)
             break
     
     logging.info(f"📊 PCM chunk reading completed, total chunks: {chunk_count}")
+    print(f"📊 CLOUDFLARE_LOG: PCM chunk reading completed - Total chunks: {chunk_count}", file=sys.stderr, flush=True)
+    
     if ffmpeg_process:
         if ffmpeg_process.poll() is not None:
             logging.info(f"📊 Final FFmpeg status: exited with code {ffmpeg_process.returncode}")
+            print(f"📊 CLOUDFLARE_LOG: Final FFmpeg status - Exited with code {ffmpeg_process.returncode}", file=sys.stderr, flush=True)
         else:
             logging.info(f"📊 Final FFmpeg status: still running (PID: {ffmpeg_process.pid})")
+            print(f"📊 CLOUDFLARE_LOG: Final FFmpeg status - Still running (PID: {ffmpeg_process.pid})", file=sys.stderr, flush=True)
 
 async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None):
     """Generator function that yields translated audio chunks from YouTube live stream"""

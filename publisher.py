@@ -61,7 +61,7 @@ except Exception as e:
 
 # Import modified youtube demo functions - this is most likely to fail
 try:
-    from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData, ytdlp_manager
+    from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData, ytdlp_manager, diagnose_ffmpeg_command, comprehensive_ffmpeg_diagnosis
     print("✅ [STARTUP] YouTube demo imports successful")
 except Exception as e:
     print(f"❌ [STARTUP] YouTube demo imports failed: {e}")
@@ -118,6 +118,38 @@ class IngestStopResponse(BaseModel):
     success: bool
     message: str
     session_id: str
+
+class FFmpegDebugRequest(BaseModel):
+    command: str  # 直接接收命令字符串，比如从日志复制的完整命令
+    timeout: int = 30
+
+class FFmpegDebugResponse(BaseModel):
+    success: bool
+    ffmpeg_version: Optional[str]
+    execution_time: float
+    chunks_generated: int
+    stderr_log: list[str]
+    error: Optional[str]
+    environment: str
+    key_issues: Optional[list[str]] = None
+
+class FFmpegTestResult(BaseModel):
+    name: str
+    description: str
+    success: bool
+    execution_time: float
+    chunks_generated: int
+    error: Optional[str]
+    status: str
+    stderr_summary: list[str]
+
+class FFmpegComprehensiveResponse(BaseModel):
+    environment: str
+    ffmpeg_path: str
+    total_execution_time: float
+    tests: list[FFmpegTestResult]
+    summary: dict[str, int]
+    analysis: list[str]
 
 @dataclass
 class PublisherSession:
@@ -523,6 +555,94 @@ async def get_sessions():
         ]
     }
 
+@app.post("/python/debug/ffmpeg", response_model=FFmpegDebugResponse)
+async def debug_ffmpeg_command(request: FFmpegDebugRequest):
+    """Debug FFmpeg command execution with detailed logging"""
+    try:
+        # Parse command string into arguments
+        import shlex
+        try:
+            command_args = shlex.split(request.command)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid command format: {e}")
+        
+        logging.info(f"🔧 DEBUG: Starting FFmpeg diagnosis")
+        logging.info(f"🔧 DEBUG: Command string: {request.command}")
+        logging.info(f"🔧 DEBUG: Parsed to {len(command_args)} arguments")
+        logging.info(f"🔧 DEBUG: Timeout: {request.timeout}s")
+        
+        print(f"🔧 CLOUDFLARE_DEBUG: Starting FFmpeg diagnosis", file=sys.stderr, flush=True)
+        print(f"🔧 CLOUDFLARE_DEBUG: Command: {request.command}", file=sys.stderr, flush=True)
+        print(f"🔧 CLOUDFLARE_DEBUG: Parsed to {len(command_args)} arguments", file=sys.stderr, flush=True)
+        
+        # Call the diagnosis function
+        result = await diagnose_ffmpeg_command(command_args, timeout=request.timeout)
+        
+        # Convert result to response model
+        response = FFmpegDebugResponse(
+            success=result["success"],
+            ffmpeg_version=result["ffmpeg_version"],
+            execution_time=result["execution_time"],
+            chunks_generated=result["chunks_generated"],
+            stderr_log=result["stderr_log"],
+            error=result["error"],
+            environment=result["environment"],
+            key_issues=result.get("key_issues")
+        )
+        
+        logging.info(f"🔧 DEBUG: Diagnosis completed - Success: {result['success']}, Chunks: {result['chunks_generated']}")
+        print(f"🔧 CLOUDFLARE_DEBUG: Diagnosis completed - Success: {result['success']}, Chunks: {result['chunks_generated']}", file=sys.stderr, flush=True)
+        
+        return response
+        
+    except Exception as e:
+        logging.error(f"🔧 DEBUG: Diagnosis failed: {e}")
+        print(f"🔧 CLOUDFLARE_ERROR: Diagnosis failed - {e}", file=sys.stderr, flush=True)
+        raise HTTPException(status_code=500, detail=f"Diagnosis failed: {str(e)}")
+
+@app.post("/python/debug/ffmpeg/comprehensive", response_model=FFmpegComprehensiveResponse)
+async def comprehensive_ffmpeg_diagnosis_endpoint():
+    """运行完整的 FFmpeg 诊断测试套件"""
+    try:
+        logging.info(f"🔧 COMPREHENSIVE: Starting comprehensive FFmpeg diagnosis")
+        print(f"🔧 CLOUDFLARE_COMPREHENSIVE_START: Starting comprehensive FFmpeg diagnosis", file=sys.stderr, flush=True)
+        
+        # 运行综合诊断
+        result = await comprehensive_ffmpeg_diagnosis()
+        
+        # 转换结果为响应模型
+        tests = []
+        for test in result["tests"]:
+            tests.append(FFmpegTestResult(
+                name=test["name"],
+                description=test["description"],
+                success=test["success"],
+                execution_time=test["execution_time"],
+                chunks_generated=test["chunks_generated"],
+                error=test["error"],
+                status=test["status"],
+                stderr_summary=test["stderr_summary"]
+            ))
+        
+        response = FFmpegComprehensiveResponse(
+            environment=result["environment"],
+            ffmpeg_path=result["ffmpeg_path"],
+            total_execution_time=result["total_execution_time"],
+            tests=tests,
+            summary=result["summary"],
+            analysis=result["analysis"]
+        )
+        
+        logging.info(f"🔧 COMPREHENSIVE: Diagnosis completed - {result['summary']['passed']} passed, {result['summary']['crashed']} crashed")
+        print(f"🔧 CLOUDFLARE_COMPREHENSIVE_END: Diagnosis completed - Total time: {result['total_execution_time']:.2f}s", file=sys.stderr, flush=True)
+        
+        return response
+        
+    except Exception as e:
+        logging.error(f"🔧 COMPREHENSIVE: Diagnosis failed: {e}")
+        print(f"🔧 CLOUDFLARE_ERROR: Comprehensive diagnosis failed - {e}", file=sys.stderr, flush=True)
+        raise HTTPException(status_code=500, detail=f"Comprehensive diagnosis failed: {str(e)}")
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -530,7 +650,8 @@ if __name__ == "__main__":
     )
     
     try:
-        host = os.getenv("HOST", "0.0.0.0")
+        # host = os.getenv("HOST", "0.0.0.0")
+        host = "0.0.0.0"
         port = 9000
         
         logging.info(f"🚀 Starting FastAPI server on {host}:{port}")
