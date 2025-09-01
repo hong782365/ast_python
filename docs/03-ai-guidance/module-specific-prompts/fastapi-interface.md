@@ -1,8 +1,36 @@
-# API接口模块提示词
+# API接口模块 AI 重写指导
+
+## 📍 系统集成视图
+
+本文档在整体架构中的位置：**HTTP API接口层**
+
+### 文档职责边界
+- **本文档职责**：FastAPI端点定义、HTTP请求响应处理、数据验证序列化、API契约维护
+- **被依赖文档**：无（作为系统入口层）
+- **依赖文档**：
+  - [session-orchestration.md](session-orchestration.md) - 调用会话管理器的业务逻辑
+  - [system-foundation.md](system-foundation.md) - 使用配置管理和日志适配
+
+### 关键集成点
+```mermaid
+graph TD
+    A[HTTP Client] -->|请求| B[FastAPI Endpoints]
+    B -->|数据验证| C[API Models]
+    B -->|业务调用| D[Session Manager]
+    D -->|启动会话| E[Audio Pipeline + VolcEngine]
+    
+    C -->|依赖| F[Pydantic Validation]
+    B -->|依赖| G[Global Config]
+    B -->|依赖| H[Logging Adapter]
+    
+    G -.详见.-> I[system-foundation.md]
+    H -.详见.-> I
+    D -.详见.-> J[session-orchestration.md]
+```
 
 ## 概述
 
-本提示词专门指导AI重写FastAPI接口层模块。这些模块负责提供RESTful API接口，处理HTTP请求响应，实现数据验证和序列化。重写时必须保持现有的接口契约和幂等性设计。
+本文档专门指导AI重写FastAPI接口层模块。这些模块作为系统的HTTP入口，负责提供RESTful API接口，处理HTTP请求响应，实现数据验证和序列化，并将业务请求路由到会话管理层。重写时必须保持现有的接口契约和幂等性设计。
 
 ## 🎯 模块重写目标
 

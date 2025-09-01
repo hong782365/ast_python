@@ -1,8 +1,40 @@
-# WebSocket处理模块提示词
+# WebSocket处理模块 AI 重写指导
+
+## 📍 系统集成视图
+
+本文档在整体架构中的位置：**VolcEngine协议通信层**
+
+### 文档职责边界
+- **本文档职责**：VolcEngine WebSocket连接、protobuf协议处理、消息序列化反序列化
+- **被依赖文档**：
+  - [session-orchestration.md](session-orchestration.md) - 会话管理器和事件处理器使用本文档的协议客户端
+- **依赖文档**：
+  - [system-foundation.md](system-foundation.md) - 配置管理、日志适配、异步工具
+  - [audio-pipeline.md](audio-pipeline.md) - 接收音频管线产生的PCM数据
+
+### 关键集成点
+```mermaid
+graph TD
+    A[Session Manager] -->|使用| B[VolcEngine Client]
+    C[Event Processor] -->|处理| D[VolcEngine Protocol]
+    E[Audio Pipeline] -->|PCM数据| B
+    
+    B -->|使用| D
+    D -->|使用| F[Message Converter]
+    B -->|双向通信| G[VolcEngine API]
+    
+    B -->|依赖| H[WebSocket Config]
+    D -->|依赖| I[Logging Adapter]
+    F -->|依赖| J[Async Utils]
+    
+    H -.详见.-> K[system-foundation.md]
+    I -.详见.-> K
+    J -.详见.-> K
+```
 
 ## 概述
 
-本提示词专门指导AI重写VolcEngine WebSocket连接管理和协议处理相关模块。这些模块负责与VolcEngine同声传译API建立和维护WebSocket连接，处理音频数据流的双向传输。重写时必须严格保持现有的成熟协议框架。
+本文档专门指导AI重写VolcEngine WebSocket连接管理和协议处理相关模块。这些模块负责与VolcEngine同声传译API建立和维护WebSocket连接，处理音频数据流的双向传输，为上层会话管理提供可靠的翻译服务接口。重写时必须严格保持现有的成熟协议框架。
 
 ## 🎯 模块重写目标
 

@@ -1,8 +1,37 @@
-# YouTube/FFmpeg处理模块提示词
+# YouTube/FFmpeg处理模块 AI 重写指导
+
+## 📍 系统集成视图
+
+本文档在整体架构中的位置：**音频基础设施层**
+
+### 文档职责边界
+- **本文档职责**：YouTube URL提取、FFmpeg进程管理、HLS协议处理、PCM数据生成
+- **被依赖文档**：
+  - [audio-pipeline.md](audio-pipeline.md) - 音频管线协调器调用本文档的组件
+  - [session-orchestration.md](session-orchestration.md) - 会话管理器间接使用本文档组件
+- **依赖文档**：
+  - [system-foundation.md](system-foundation.md) - 环境检测、配置管理、日志适配
+
+### 关键集成点
+```mermaid
+graph TD
+    A[Audio Pipeline] -->|调用| B[yt-dlp Manager]
+    A -->|调用| C[FFmpeg Manager]
+    B -->|提取URL| D[YouTube Live Stream]
+    C -->|转换PCM| E[VolcEngine API]
+    B -->|依赖| F[Environment Detector]
+    C -->|依赖| F
+    B -->|依赖| G[Threading Utils]
+    C -->|依赖| H[Logging Adapter]
+    
+    F -.详见.-> I[system-foundation.md]
+    G -.详见.-> I
+    H -.详见.-> I
+```
 
 ## 概述
 
-本提示词专门指导AI重写YouTube音频处理和FFmpeg管理相关模块。这些模块负责从YouTube直播流提取音频并转换为VolcEngine API所需的PCM格式。重写时必须保持现有的并行处理策略和环境适配逻辑。
+本文档专门指导AI重写YouTube音频处理和FFmpeg管理相关模块。这些模块负责从YouTube直播流提取音频并转换为VolcEngine API所需的PCM格式，为上层音频管线提供稳定的音频数据流。重写时必须保持现有的并行处理策略和环境适配逻辑。
 
 ## 🎯 模块重写目标
 
