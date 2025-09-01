@@ -61,7 +61,8 @@ except Exception as e:
 
 # Import modified youtube demo functions - this is most likely to fail
 try:
-    from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData, ytdlp_manager, diagnose_ffmpeg_command, comprehensive_ffmpeg_diagnosis
+    from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData, ytdlp_manager
+    from ffmpeg_diagnosis import diagnose_ffmpeg_command, comprehensive_ffmpeg_diagnosis
     print("✅ [STARTUP] YouTube demo imports successful")
 except Exception as e:
     print(f"❌ [STARTUP] YouTube demo imports failed: {e}")
