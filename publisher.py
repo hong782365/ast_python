@@ -212,6 +212,9 @@ class AudioStreamPublisher:
         task = asyncio.create_task(self._publish_audio_stream(session))
         session.task = task
         
+        # 添加任务完成回调，自动清理会话（避免内存泄漏）
+        task.add_done_callback(lambda task_obj: self._schedule_session_cleanup(session_id))
+        
         return session_id, True, 201  # HTTP 201 Created - 新会话创建成功
     
     async def stop_publishing_session(self, session_id: str) -> bool:
@@ -247,12 +250,27 @@ class AudioStreamPublisher:
         
         return True
     
+    def _schedule_session_cleanup(self, session_id: str):
+        """安全地调度会话清理，避免在任务回调中直接调用async方法"""
+        # 任务完成回调是同步的，所以投递一个后台协程来处理清理
+        try:
+            # 只负责从sessions字典中移除，避免复杂的资源清理操作
+            if session_id in self.sessions:
+                session = self.sessions[session_id]
+                # 记录最终状态用于调试
+                final_status = getattr(session, 'status', 'unknown')
+                del self.sessions[session_id]
+                self.logger.info(f"Session {session_id} auto-cleaned from sessions dict (final status: {final_status})")
+        except Exception as e:
+            self.logger.warning(f"Error in session auto-cleanup for {session_id}: {e}")
+    
     async def _cleanup_session(self, session_id: str):
         """Cleanup session resources"""
-        if session_id not in self.sessions:
+        # 获取会话对象，如果已被自动清理则跳过
+        session = self.sessions.get(session_id)
+        if not session:
+            self.logger.debug(f"Session {session_id} already cleaned up")
             return
-        
-        session = self.sessions[session_id]
         
         # Cancel task if still running
         if session.task and not session.task.done():
@@ -276,10 +294,10 @@ class AudioStreamPublisher:
             except Exception as e:
                 self.logger.warning(f"Error cleaning up streamer for session {session_id}: {e}")
         
-        # 从字典中移除会话，避免内存泄漏
+        # 从字典中移除会话，避免内存泄漏（如果还没被自动清理）
         if session_id in self.sessions:
             del self.sessions[session_id]
-            self.logger.info(f"Session {session_id} removed from sessions dict")
+            self.logger.info(f"Session {session_id} removed from sessions dict via cleanup")
         
         self.logger.info(f"Session {session_id} cleaned up completely")
     
@@ -311,6 +329,11 @@ class AudioStreamPublisher:
             session.status = "processing_audio"
             await self._stream_translated_audio(config, session, ws_client)
             
+        except asyncio.CancelledError:
+            # 任务被取消（stop操作或其他取消场景）
+            self.logger.info(f"Session {session.session_id}: Publishing cancelled")
+            session.status = "stopped"
+            raise  # 重新抛出，保持取消语义
         except Exception as e:
             self.logger.error(f"Session {session.session_id}: Publishing failed: {e}")
             session.status = "failed"
