@@ -169,18 +169,31 @@ class AudioStreamPublisher:
         self.sessions: Dict[str, PublisherSession] = {}
         self.logger = logging.getLogger(__name__)
         
-    async def start_publishing_session(self, session_id: str, youtube_url: str, publish_url: str) -> tuple[str, bool]:
+    async def start_publishing_session(self, session_id: str, youtube_url: str, publish_url: str) -> tuple[str, bool, int]:
         """Start a new publishing session or return existing one (idempotent)"""
-        # Check if session already exists and is active
+        # 一容器一链接：检查活跃会话状态
+        active_statuses = ["initializing", "starting", "connected_to_publisher", "processing_audio"]
+        
+        # 检查是否已存在相同session_id
         if session_id in self.sessions:
             existing_session = self.sessions[session_id]
-            if existing_session.status in ["initializing", "starting", "connected_to_publisher", "processing_audio"]:
+            if existing_session.status in active_statuses:
                 self.logger.info(f"Session {session_id} already running with status: {existing_session.status}")
-                return session_id, False  # False indicates session was already running
+                return session_id, False, 202  # HTTP 202 Accepted - 已在跑，幂等
             else:
                 # Session exists but is not active, remove it
                 self.logger.info(f"Removing inactive session {session_id} with status: {existing_session.status}")
                 await self._cleanup_session(session_id)
+        
+        # 检查是否有其他sessionId的活跃会话（一容器一链接限制）
+        active_sessions = [
+            s for s in self.sessions.values() 
+            if s.status in active_statuses
+        ]
+        if active_sessions:
+            active_session = active_sessions[0]
+            self.logger.warning(f"Container busy with active session {active_session.session_id} (status: {active_session.status})")
+            return session_id, False, 409  # HTTP 409 Conflict - 容器忙碌
         
         # Create new session
         stop_event = asyncio.Event()
@@ -199,7 +212,7 @@ class AudioStreamPublisher:
         task = asyncio.create_task(self._publish_audio_stream(session))
         session.task = task
         
-        return session_id, True  # True indicates new session was created
+        return session_id, True, 201  # HTTP 201 Created - 新会话创建成功
     
     async def stop_publishing_session(self, session_id: str) -> bool:
         """Stop a publishing session (idempotent)"""
@@ -263,7 +276,12 @@ class AudioStreamPublisher:
             except Exception as e:
                 self.logger.warning(f"Error cleaning up streamer for session {session_id}: {e}")
         
-        self.logger.info(f"Session {session_id} cleaned up")
+        # 从字典中移除会话，避免内存泄漏
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            self.logger.info(f"Session {session_id} removed from sessions dict")
+        
+        self.logger.info(f"Session {session_id} cleaned up completely")
     
     async def _publish_audio_stream(self, session: PublisherSession):
         """Main publishing logic"""
@@ -297,8 +315,14 @@ class AudioStreamPublisher:
             self.logger.error(f"Session {session.session_id}: Publishing failed: {e}")
             session.status = "failed"
         finally:
+            # 只在正常完成时才设置completed，保留failed/stopped状态
             if session.session_id in self.sessions:
-                self.sessions[session.session_id].status = "completed"
+                current_status = self.sessions[session.session_id].status
+                if current_status not in ["failed", "stopped"]:
+                    self.sessions[session.session_id].status = "completed"
+                    self.logger.info(f"Session {session.session_id}: Set status to completed")
+                else:
+                    self.logger.info(f"Session {session.session_id}: Keeping status as {current_status}")
     
     async def _stream_translated_audio(self, config: Config, session: PublisherSession, ws_client):
         """Stream translated PCM audio and subtitles to WebSocket publisher"""
@@ -481,20 +505,21 @@ async def start_ingest(request: IngestStartRequest):
             raise HTTPException(status_code=400, detail="Invalid WebSocket publish URL")
         
         # Start publishing session (idempotent)
-        session_id, is_new = await publisher.start_publishing_session(
+        session_id, is_new, status_code = await publisher.start_publishing_session(
             request.sessionId,
             request.youtube_url, 
             request.publishUrl
         )
         
-        if is_new:
+        if status_code == 201:
+            # 新会话创建成功
             return IngestStartResponse(
                 success=True,
                 message="Ingestion started successfully",
                 session_id=session_id
             )
-        else:
-            # Session already running, return 202 Accepted
+        elif status_code == 202:
+            # 同sessionId已在运行，幂等返回
             from fastapi import status
             from fastapi.responses import JSONResponse
             return JSONResponse(
@@ -504,6 +529,12 @@ async def start_ingest(request: IngestStartRequest):
                     "message": "Session already running",
                     "session_id": session_id
                 }
+            )
+        elif status_code == 409:
+            # 容器忙碌，不同sessionId冲突
+            raise HTTPException(
+                status_code=409, 
+                detail=f"Container is busy with another session. This container supports only one active session at a time."
             )
         
     except Exception as e:

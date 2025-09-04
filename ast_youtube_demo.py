@@ -575,7 +575,7 @@ class YouTubeLiveStreamer:
                 "-ar", "16000",  # 音频采样率：16000Hz
                 "-acodec", "pcm_s16le",  # 音频编码器：16位小端序 PCM
                 "-f", "s16le",  # 输出格式：16位小端序原始音频
-                "-t", str(self.duration_seconds),  # 限制处理时长（秒）
+                # 移除 "-t" 参数，支持无限时长直播直到显式stop
                 "-y",  # 覆盖输出文件（如果存在）
                 "pipe:1"  # 输出到 stdout 标准输出（管道）
             ])
@@ -1139,6 +1139,8 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
     loop = asyncio.get_event_loop()
     chunk_count = 0
     first_chunk_received = False
+    consecutive_timeouts = 0  # 连续超时计数
+    max_consecutive_timeouts = 3  # 连续超时阈值
     
     logging.info(f"Starting PCM chunk reading, chunk_size: {chunk_size}")
     
@@ -1163,28 +1165,39 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                     loop.run_in_executor(None, pcm_stream.read, chunk_size),
                     timeout=timeout_duration
                 )
-            except asyncio.TimeoutError:
-                # Check FFmpeg process status on timeout
-                if ffmpeg_process:
-                    if ffmpeg_process.poll() is not None:
-                        logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: FFmpeg process exited (code: {ffmpeg_process.returncode})")
-                        logging.error(f"⏰ Check FFmpeg console log file for error details")
-                        print(f"⏰ CLOUDFLARE_ERROR: PCM read timeout - FFmpeg exited with code {ffmpeg_process.returncode}", file=sys.stderr, flush=True)
-                    else:
-                        logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: FFmpeg still running (PID: {ffmpeg_process.pid})")
-                        logging.error(f"⏰ This suggests the stream ended or FFmpeg is blocked")
-                        print(f"⏰ CLOUDFLARE_ERROR: PCM read timeout - FFmpeg blocked/stuck (PID: {ffmpeg_process.pid})", file=sys.stderr, flush=True)
-                else:
-                    logging.error(f"⏰ Timeout reading chunk {chunk_count + 1}: No FFmpeg process reference")
-                    print(f"⏰ CLOUDFLARE_ERROR: PCM read timeout - No FFmpeg process reference", file=sys.stderr, flush=True)
+                # 成功读取，重置连续超时计数
+                consecutive_timeouts = 0
                 
+            except asyncio.TimeoutError:
+                consecutive_timeouts += 1
+                
+                # 首包超时：立即结束（兼容广告/播放列表warmup场景）
                 if chunk_count == 0:
                     logging.error("🔴 Timeout waiting for first PCM chunk - ffmpeg may be stuck or stream unavailable")
                     print("🔴 CLOUDFLARE_ERROR: Timeout waiting for first PCM chunk - Stream unavailable or FFmpeg stuck", file=sys.stderr, flush=True)
+                    break
+                
+                # 后续包：连续超时阈值检测
+                logging.warning(f"⏰ PCM读取超时 #{consecutive_timeouts}/{max_consecutive_timeouts} (chunk {chunk_count + 1})")
+                
+                if consecutive_timeouts >= max_consecutive_timeouts:
+                    # 连续超时达到阈值，判定为真实断流
+                    logging.error(f"🔴 连续{max_consecutive_timeouts}次超时，判定为直播流中断")
+                    print(f"🔴 CLOUDFLARE_ERROR: 连续{max_consecutive_timeouts}次超时，直播流中断", file=sys.stderr, flush=True)
+                    
+                    # Check FFmpeg process status on final timeout
+                    if ffmpeg_process:
+                        if ffmpeg_process.poll() is not None:
+                            logging.error(f"⏰ FFmpeg process exited (code: {ffmpeg_process.returncode})")
+                            print(f"⏰ CLOUDFLARE_ERROR: FFmpeg exited with code {ffmpeg_process.returncode}", file=sys.stderr, flush=True)
+                        else:
+                            logging.error(f"⏰ FFmpeg still running (PID: {ffmpeg_process.pid}) but stream seems ended")
+                            print(f"⏰ CLOUDFLARE_ERROR: FFmpeg running but stream ended (PID: {ffmpeg_process.pid})", file=sys.stderr, flush=True)
+                    break
                 else:
-                    logging.error(f"🔴 Timeout reading PCM chunk {chunk_count + 1} - stream may have ended")
-                    print(f"🔴 CLOUDFLARE_ERROR: Timeout reading PCM chunk {chunk_count + 1} - Stream may have ended", file=sys.stderr, flush=True)
-                break
+                    # 未达阈值，继续重试
+                    logging.info(f"🔄 第{consecutive_timeouts}次超时，继续重试 (阈值: {max_consecutive_timeouts})")
+                    continue
             
             if not chunk:
                 logging.info(f"📄 PCM stream ended naturally after {chunk_count} chunks")
