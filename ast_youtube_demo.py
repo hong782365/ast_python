@@ -964,8 +964,14 @@ class YouTubeLiveStreamer:
         
         # No need to clean up yt_dlp_process since we're using library mode now
 
-async def send_request(ws, request: TranslateRequestData):
-    """Send request to WebSocket server"""
+async def send_request(ws, request: TranslateRequestData, log_raw: bool = True):
+    """Send request to WebSocket server
+    
+    Args:
+        ws: WebSocket connection
+        request: Request data to send
+        log_raw: Whether to log the raw protobuf message (default True)
+    """
     request_data = TranslateRequest()
     request_data.request_meta.SessionID = request.session_id
     if request.event == "Type_StartSession":
@@ -990,8 +996,9 @@ async def send_request(ws, request: TranslateRequestData):
     request_data.request.source_language = SOURCE_LANGUAGE
     request_data.request.target_language = TARGET_LANGUAGE
     
-    # 打印原始发送请求
-    log_protobuf_message(request_data, "SEND")
+    # 打印原始发送请求（根据log_raw参数控制）
+    if log_raw:
+        log_protobuf_message(request_data, "SEND")
     
     await ws.send(request_data.SerializeToString())
 
@@ -1069,7 +1076,7 @@ async def send_silence_until_ready(conn, session_id, audio_ready_event, timeout_
                 source_audio=Audio(binary_data=silence_chunk)
             )
             
-            await send_request(conn, chunk_request)
+            await send_request(conn, chunk_request, log_raw=False)
             frame_count += 1
             
             # Log every 50 frames (1 second)
@@ -1446,7 +1453,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     if chunk_count == 1 or chunk_count % 50 == 0:
                         event_logger.log_send_event(Type.TaskRequest, chunk_request)
                     
-                    await send_request(conn, chunk_request)
+                    await send_request(conn, chunk_request, log_raw=False)
                     await asyncio.sleep(0.02)  # 20ms delay to match chunk rate
                 
                 logging.info(f"Finished sending {chunk_count} PCM chunks, total {total_bytes} bytes")
@@ -1613,7 +1620,7 @@ async def translate_youtube_live(conf: Config, youtube_url: str, duration_second
                         event="Type_TaskRequest",
                         source_audio=Audio(binary_data=chunk)
                     )
-                    await send_request(conn, chunk_request)
+                    await send_request(conn, chunk_request, log_raw=False)
                     await asyncio.sleep(0.02)  # 20ms delay to match chunk rate
                 
                 logging.info(f"Finished sending {chunk_count} PCM chunks")
