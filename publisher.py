@@ -244,33 +244,27 @@ class AudioStreamPublisher:
         # Update status immediately (立即返回 - 不等待任务完成)
         session.status = "stopped"
         
-        # 触发后台清理，不阻塞返回
-        asyncio.create_task(self._background_cleanup(session_id))
+        # 触发后台清理，不阻塞返回，传递会话对象避免竞态
+        asyncio.create_task(self._background_cleanup(session))
         
         return True
     
     def _schedule_session_cleanup(self, session_id: str):
         """安全地调度会话清理，避免在任务回调中直接调用async方法"""
-        # 任务完成回调是同步的，所以投递一个后台协程来处理清理
+        # 任务完成回调是同步的，只记录状态，不删除字典（避免与后台清理竞态）
         try:
-            # 只负责从sessions字典中移除，避免复杂的资源清理操作
             if session_id in self.sessions:
                 session = self.sessions[session_id]
                 # 记录最终状态用于调试
                 final_status = getattr(session, 'status', 'unknown')
-                del self.sessions[session_id]
-                self.logger.info(f"Session {session_id} auto-cleaned from sessions dict (final status: {final_status})")
+                self.logger.info(f"Session {session_id} task completed (final status: {final_status}) - cleanup will be handled by background cleanup")
         except Exception as e:
             self.logger.warning(f"Error in session auto-cleanup for {session_id}: {e}")
     
-    async def _background_cleanup(self, session_id: str):
+    async def _background_cleanup(self, session: PublisherSession):
         """后台清理器：先断连再等待，避免阻塞stop接口"""
+        session_id = session.session_id
         try:
-            session = self.sessions.get(session_id)
-            if not session:
-                self.logger.debug(f"Session {session_id} already cleaned up")
-                return
-            
             self.logger.info(f"Starting background cleanup for session {session_id}")
             
             # Phase 1: 立即断开关键连接（不等待）
@@ -311,6 +305,11 @@ class AudioStreamPublisher:
             # Phase 4: 最终清理（兜底）
             await self._cleanup_session(session_id)
             
+            # Phase 5: 从字典中移除会话（避免竞态，在最后执行）
+            if session_id in self.sessions:
+                del self.sessions[session_id]
+                self.logger.info(f"Session {session_id} removed from sessions dict via background cleanup")
+            
             self.logger.info(f"Background cleanup completed for session {session_id}")
             
         except Exception as e:
@@ -318,6 +317,10 @@ class AudioStreamPublisher:
             # 即使后台清理失败，也要尝试基本清理
             try:
                 await self._cleanup_session(session_id)
+                # 确保即使清理失败也要移除字典条目
+                if session_id in self.sessions:
+                    del self.sessions[session_id]
+                    self.logger.info(f"Session {session_id} removed from sessions dict after cleanup failure")
             except Exception as cleanup_e:
                 self.logger.error(f"Final cleanup also failed for session {session_id}: {cleanup_e}")
     
@@ -333,9 +336,12 @@ class AudioStreamPublisher:
         if session.task and not session.task.done():
             session.task.cancel()
             try:
-                await session.task
+                # 添加超时保护，避免无限等待（后台清理已等待过，这里快速处理）
+                await asyncio.wait_for(session.task, timeout=1.0)
             except asyncio.CancelledError:
                 pass
+            except asyncio.TimeoutError:
+                self.logger.warning(f"Session {session_id}: Task cancellation timeout in cleanup, forcing continue")
         
         # Cleanup WebSocket connections
         if session.websocket:
@@ -358,12 +364,8 @@ class AudioStreamPublisher:
             except Exception as e:
                 self.logger.warning(f"Error cleaning up streamer for session {session_id}: {e}")
         
-        # 从字典中移除会话，避免内存泄漏（如果还没被自动清理）
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            self.logger.info(f"Session {session_id} removed from sessions dict via cleanup")
-        
-        self.logger.info(f"Session {session_id} cleaned up completely")
+        # 字典清理由后台清理器负责，这里只清理资源
+        self.logger.info(f"Session {session_id} resources cleaned up (dict removal handled by background cleanup)")
     
     async def _publish_audio_stream(self, session: PublisherSession):
         """Main publishing logic"""
