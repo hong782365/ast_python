@@ -163,6 +163,7 @@ class PublisherSession:
     streamer: Optional[YouTubeLiveStreamer] = None
     task: Optional[asyncio.Task] = None
     stop_event: Optional[asyncio.Event] = None
+    publisher_ws: Optional[Any] = None  # WebSocket发布客户端引用，防止泄漏
 
 class AudioStreamPublisher:
     def __init__(self):
@@ -239,14 +240,12 @@ class AudioStreamPublisher:
         # Cancel the task if it exists
         if session.task and not session.task.done():
             session.task.cancel()
-            try:
-                await session.task
-            except asyncio.CancelledError:
-                pass
         
-        # Update status and cleanup
+        # Update status immediately (立即返回 - 不等待任务完成)
         session.status = "stopped"
-        await self._cleanup_session(session_id)
+        
+        # 触发后台清理，不阻塞返回
+        asyncio.create_task(self._background_cleanup(session_id))
         
         return True
     
@@ -264,6 +263,64 @@ class AudioStreamPublisher:
         except Exception as e:
             self.logger.warning(f"Error in session auto-cleanup for {session_id}: {e}")
     
+    async def _background_cleanup(self, session_id: str):
+        """后台清理器：先断连再等待，避免阻塞stop接口"""
+        try:
+            session = self.sessions.get(session_id)
+            if not session:
+                self.logger.debug(f"Session {session_id} already cleaned up")
+                return
+            
+            self.logger.info(f"Starting background cleanup for session {session_id}")
+            
+            # Phase 1: 立即断开关键连接（不等待）
+            cleanup_tasks = []
+            
+            # 关闭发布端WebSocket连接
+            if session.publisher_ws:
+                try:
+                    cleanup_tasks.append(asyncio.create_task(session.publisher_ws.disconnect()))
+                    self.logger.info(f"Session {session_id}: Initiated publisher WebSocket disconnect")
+                except Exception as e:
+                    self.logger.warning(f"Error initiating publisher WebSocket disconnect: {e}")
+            
+            # 关闭streamer (FFmpeg进程等)
+            if session.streamer:
+                try:
+                    cleanup_tasks.append(asyncio.create_task(session.streamer.cleanup()))
+                    self.logger.info(f"Session {session_id}: Initiated streamer cleanup")
+                except Exception as e:
+                    self.logger.warning(f"Error initiating streamer cleanup: {e}")
+            
+            # Phase 2: 等待任务取消完成（有超时保护）
+            if session.task and not session.task.done():
+                try:
+                    await asyncio.wait_for(session.task, timeout=3.0)  # 3秒超时
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"Session {session_id}: Task cancellation timeout, forcing cleanup")
+                except Exception as e:
+                    self.logger.debug(f"Session {session_id}: Task ended with exception (expected): {e}")
+            
+            # Phase 3: 等待清理任务完成（有超时保护）
+            if cleanup_tasks:
+                try:
+                    await asyncio.wait_for(asyncio.gather(*cleanup_tasks, return_exceptions=True), timeout=5.0)
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"Session {session_id}: Cleanup tasks timeout")
+            
+            # Phase 4: 最终清理（兜底）
+            await self._cleanup_session(session_id)
+            
+            self.logger.info(f"Background cleanup completed for session {session_id}")
+            
+        except Exception as e:
+            self.logger.error(f"Background cleanup failed for session {session_id}: {e}")
+            # 即使后台清理失败，也要尝试基本清理
+            try:
+                await self._cleanup_session(session_id)
+            except Exception as cleanup_e:
+                self.logger.error(f"Final cleanup also failed for session {session_id}: {cleanup_e}")
+    
     async def _cleanup_session(self, session_id: str):
         """Cleanup session resources"""
         # 获取会话对象，如果已被自动清理则跳过
@@ -280,12 +337,19 @@ class AudioStreamPublisher:
             except asyncio.CancelledError:
                 pass
         
-        # Cleanup WebSocket connection
+        # Cleanup WebSocket connections
         if session.websocket:
             try:
                 await session.websocket.close()
             except Exception as e:
                 self.logger.warning(f"Error closing WebSocket for session {session_id}: {e}")
+        
+        # Cleanup publisher WebSocket connection
+        if session.publisher_ws:
+            try:
+                await session.publisher_ws.disconnect()
+            except Exception as e:
+                self.logger.warning(f"Error disconnecting publisher WebSocket for session {session_id}: {e}")
         
         # Cleanup streamer
         if session.streamer:
@@ -324,6 +388,9 @@ class AudioStreamPublisher:
             ws_client = WebSocketPublishClient(session.publish_url, session.session_id)
             await ws_client.connect()
             session.status = "connected_to_publisher"
+            
+            # 保存WebSocket客户端引用，防止取消时泄漏
+            session.publisher_ws = ws_client
             
             # Start YouTube live translation stream
             session.status = "processing_audio"
