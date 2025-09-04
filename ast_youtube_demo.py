@@ -106,6 +106,95 @@ class StreamData:
     data_type: str  # "audio" or "subtitle"
     content: Union[bytes, str]  # binary audio data or JSON string
 
+def safe_serialize_protobuf(pb_obj):
+    """
+    安全序列化protobuf对象为字典，用于JSON输出
+    - 递归遍历已设置的字段
+    - 二进制字段替换为"二进制数据"字符串
+    - 保持原始字段名和结构
+    """
+    from google.protobuf.descriptor import FieldDescriptor
+    
+    def serialize_value(field_descriptor, value):
+        # 处理二进制字段
+        if isinstance(value, bytes) or field_descriptor.type == FieldDescriptor.TYPE_BYTES:
+            return "二进制数据"
+        
+        # 处理重复字段（列表）
+        if field_descriptor.label == FieldDescriptor.LABEL_REPEATED:
+            return [serialize_value_single(field_descriptor, item) for item in value]
+        else:
+            return serialize_value_single(field_descriptor, value)
+    
+    def serialize_value_single(field_descriptor, value):
+        # 处理嵌套消息
+        if field_descriptor.type == FieldDescriptor.TYPE_MESSAGE:
+            return safe_serialize_protobuf(value)  # 递归处理
+        
+        # 处理枚举（输出原始数值）
+        elif field_descriptor.type == FieldDescriptor.TYPE_ENUM:
+            return int(value)
+        
+        # 处理二进制
+        elif isinstance(value, bytes) or field_descriptor.type == FieldDescriptor.TYPE_BYTES:
+            return "二进制数据"
+        
+        # 处理标量值（字符串、整数、浮点、布尔）
+        else:
+            return value
+    
+    if not hasattr(pb_obj, 'ListFields'):
+        # 不是protobuf对象，直接返回
+        return pb_obj
+    
+    result = {}
+    try:
+        # 遍历所有已设置的字段
+        for field_descriptor, value in pb_obj.ListFields():
+            try:
+                field_name = field_descriptor.name
+                result[field_name] = serialize_value(field_descriptor, value)
+            except Exception as e:
+                # 跳过异常字段，记录警告
+                import sys
+                print(f"WARN: 序列化字段 {field_descriptor.name} 失败: {e}", file=sys.stderr, flush=True)
+                continue
+    except Exception as e:
+        import sys
+        print(f"WARN: protobuf序列化失败: {e}", file=sys.stderr, flush=True)
+        return {"error": "序列化失败"}
+    
+    return result
+
+def log_protobuf_message(pb_obj, prefix=""):
+    """
+    打印protobuf对象的原始结构到stderr
+    - 单行JSON格式
+    - 带时间戳前缀
+    - 立即flush
+    """
+    import json
+    import time
+    import sys
+    
+    try:
+        # 安全序列化
+        serialized = safe_serialize_protobuf(pb_obj)
+        
+        # 生成时间戳
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()) + f".{int(time.time() * 1000) % 1000:03d}"
+        
+        # 单行JSON输出
+        json_str = json.dumps(serialized, ensure_ascii=False, separators=(',', ':'))
+        
+        # 输出到stderr
+        log_line = f"{timestamp} {prefix} {json_str}"
+        print(log_line, file=sys.stderr, flush=True)
+        
+    except Exception as e:
+        # 序列化失败的异常处理
+        print(f"ERROR: protobuf日志输出失败: {e}", file=sys.stderr, flush=True)
+
 class ASTEventLogger:
     """事件日志记录器，用于记录同声传译的事件消息"""
     
@@ -900,6 +989,10 @@ async def send_request(ws, request: TranslateRequestData):
     request_data.request.mode = "s2s"
     request_data.request.source_language = SOURCE_LANGUAGE
     request_data.request.target_language = TARGET_LANGUAGE
+    
+    # 打印原始发送请求
+    log_protobuf_message(request_data, "SEND")
+    
     await ws.send(request_data.SerializeToString())
 
 async def receive_message(ws) -> TranslateResponseData:
@@ -907,6 +1000,9 @@ async def receive_message(ws) -> TranslateResponseData:
     response = await ws.recv()
     Response_data = TranslateResponse()
     Response_data.ParseFromString(response)
+    
+    # 打印原始接收响应
+    log_protobuf_message(Response_data, "RECV")
     # Parse billing information if present
     status_code_value: Optional[int] = None
     billing_value: Optional[BillingData] = None
