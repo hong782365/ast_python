@@ -485,6 +485,13 @@ class AudioStreamPublisher:
                     # Send subtitle JSON as text message
                     await ws_client.send_text_message(stream_data.content)
                     self.logger.debug(f"Session {session.session_id}: Sent subtitle: {stream_data.content}")
+                elif stream_data.data_type == "error":
+                    # Handle live check errors (Codex方案错误处理)
+                    self.logger.warning(f"Session {session.session_id}: Live check failed, sending error to client")
+                    await ws_client.send_text_message(stream_data.content)
+                    self.logger.info(f"Session {session.session_id}: Error message sent: {stream_data.content}")
+                    # Error已发送，流程即将结束
+                    break
                 
         except asyncio.CancelledError:
             self.logger.info(f"Session {session.session_id}: Streaming cancelled")

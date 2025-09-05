@@ -561,6 +561,63 @@ class YtDlpManager:
             logging.error(f"📡 Sync URL extraction failed: {e}")
             raise
     
+    async def check_live_status(self, youtube_url: str) -> dict:
+        """异步检查YouTube直播状态（轻量级，只获取必要信息）"""
+        logging.info("🔍 Checking YouTube live status...")
+        check_start_time = time.time()
+        
+        try:
+            # 在线程池中运行yt-dlp以避免阻塞事件循环
+            loop = asyncio.get_event_loop()
+            live_info = await loop.run_in_executor(
+                self.executor, 
+                self._check_live_status_sync, 
+                youtube_url
+            )
+            
+            check_elapsed = time.time() - check_start_time
+            logging.info(f"🔍 Live status check completed in {check_elapsed:.2f}s")
+            logging.info(f"🔍 Result: {live_info}")
+            
+            return live_info
+            
+        except Exception as e:
+            logging.error(f"🔍 Failed to check live status: {e}")
+            check_elapsed = time.time() - check_start_time
+            return {
+                "is_live": None,
+                "live_status": None, 
+                "title": None,
+                "release_timestamp": None,
+                "error": str(e),
+                "check_duration": check_elapsed
+            }
+    
+    def _check_live_status_sync(self, youtube_url: str) -> dict:
+        """同步检查直播状态方法，在线程池中执行"""
+        try:
+            ydl = self._create_ydl_instance()
+            # 使用 process=False 只获取基本信息，不处理格式，更快速
+            info = ydl.extract_info(youtube_url, download=False, process=False)
+            
+            # 提取关键字段
+            is_live = info.get('is_live')
+            live_status = info.get('live_status')
+            title = info.get('title')
+            release_timestamp = info.get('release_timestamp')
+            
+            return {
+                "is_live": is_live,
+                "live_status": live_status,
+                "title": title,
+                "release_timestamp": release_timestamp,
+                "error": None
+            }
+            
+        except Exception as e:
+            logging.error(f"🔍 Sync live status check failed: {e}")
+            raise
+    
     def cleanup(self):
         """清理资源"""
         if self.executor:
@@ -1099,6 +1156,67 @@ async def send_silence_until_ready(conn, session_id, audio_ready_event, timeout_
         logging.error(f"🔇 Silence bridge traceback: {traceback.format_exc()}")
         return silence_duration, frame_count
 
+async def send_silence_until_ready_with_live_check(conn, session_id, audio_ready_event, live_check_passed_event, timeout_seconds=8):
+    """Send silence frames until both audio is ready AND live check passed (两阶段门控)"""
+    silence_chunk = b'\x00' * 640  # 640 bytes of silence (20ms at 16kHz mono s16le)
+    silence_start_time = time.monotonic()
+    frame_count = 0
+    
+    logging.info(f"🔇 Starting enhanced silence bridge with live check (timeout: {timeout_seconds}s)")
+    
+    try:
+        while True:
+            # Check if both conditions are met (两阶段门控核心逻辑)
+            audio_ready = audio_ready_event.is_set()
+            live_check_passed = live_check_passed_event.is_set()
+            
+            if audio_ready and live_check_passed:
+                logging.info(f"🔇 Both conditions met: audio ready AND live check passed")
+                break
+            
+            # Check timeout
+            elapsed = time.monotonic() - silence_start_time
+            if elapsed >= timeout_seconds:
+                logging.warning(f"🔇 Enhanced silence bridge timeout after {elapsed:.2f}s, {frame_count} frames sent")
+                logging.warning(f"🔇 Final state: audio_ready={audio_ready}, live_check_passed={live_check_passed}")
+                break
+            
+            # Send silence frame
+            chunk_request = TranslateRequestData(
+                session_id=session_id,
+                event="Type_TaskRequest",
+                source_audio=Audio(binary_data=silence_chunk)
+            )
+            
+            await send_request(conn, chunk_request, log_raw=False)
+            frame_count += 1
+            
+            # Log every 50 frames (1 second) with status
+            if frame_count % 50 == 0:
+                logging.info(f"🔇 Enhanced silence bridge: {frame_count} frames sent ({elapsed:.1f}s), audio_ready={audio_ready}, live_check_passed={live_check_passed}")
+            
+            # Wait 20ms for next frame
+            await asyncio.sleep(0.02)
+        
+        # Both conditions ready
+        silence_duration = time.monotonic() - silence_start_time
+        final_audio_ready = audio_ready_event.is_set()
+        final_live_check_passed = live_check_passed_event.is_set()
+        
+        if final_audio_ready and final_live_check_passed:
+            logging.info(f"🔇 Enhanced silence bridge completed: {frame_count} frames sent in {silence_duration:.2f}s")
+        else:
+            logging.warning(f"🔇 Enhanced silence bridge ended without full readiness: audio={final_audio_ready}, live={final_live_check_passed}")
+        
+        return silence_duration, frame_count
+        
+    except Exception as e:
+        silence_duration = time.monotonic() - silence_start_time
+        logging.error(f"🔇 Enhanced silence bridge error after {silence_duration:.2f}s: {e}")
+        import traceback
+        logging.error(f"🔇 Enhanced silence bridge traceback: {traceback.format_exc()}")
+        return silence_duration, frame_count
+
 def map_event_to_subtitle_json(resp: TranslateResponseData) -> Optional[str]:
     """Map WebSocket events (650-655) to unified JSON format"""
     subtitle_msg = None
@@ -1377,12 +1495,13 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
     # 初始化事件日志记录器
     event_logger = ASTEventLogger(youtube_url)
     
-    # Create audio ready event for coordination
-    audio_ready_event = asyncio.Event()
+    # Create events for coordination (两阶段门控)
+    audio_ready_event = asyncio.Event()  # 首帧PCM就绪
+    live_check_passed_event = asyncio.Event()  # 直播检查通过
     
     try:
-        # Start both tasks in parallel
-        logging.info("🚀 Starting parallel initialization: ffmpeg + WebSocket...")
+        # Start three tasks in parallel (Codex方案核心改动)
+        logging.info("🚀 Starting parallel initialization: ffmpeg + WebSocket + live check...")
         parallel_start_time = time.monotonic()
         
         # Task 1: Start ffmpeg streaming pipeline
@@ -1393,22 +1512,96 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             connect_websocket_and_start_session(conf, SOURCE_LANGUAGE, TARGET_LANGUAGE, event_logger)
         )
         
-        # Wait for both to complete
-        pcm_stream, (conn, session_id, log_id, ws_connect_duration) = await asyncio.gather(
-            ffmpeg_task, websocket_task
+        # Task 3: Check live status (新增)
+        live_check_task = asyncio.create_task(ytdlp_manager.check_live_status(youtube_url))
+        
+        # Wait for all three to complete
+        pcm_stream, (conn, session_id, log_id, ws_connect_duration), live_info = await asyncio.gather(
+            ffmpeg_task, websocket_task, live_check_task
         )
         
         parallel_duration = time.monotonic() - parallel_start_time
         logging.info(f"🚀 Parallel initialization completed in {parallel_duration:.2f}s")
         logging.info(f"📊 WebSocket connect duration: {ws_connect_duration:.2f}s")
         
-        # Create queues for communication between sender and receiver
+        # Create queues for communication (需要提前创建，用于错误处理)
         stream_queue = asyncio.Queue()  # Queue for both audio and subtitle data
         finished = asyncio.Event()
         
-        # Start silence bridge immediately
+        # 检查直播状态 (Codex方案核心逻辑)
+        def is_live_valid(live_info):
+            """判断直播状态是否有效"""
+            # 如果检查过程出错，直接拒绝
+            if live_info.get('error'):
+                return False, "LIVE_STATUS_UNKNOWN"
+            
+            is_live = live_info.get('is_live')
+            live_status = live_info.get('live_status')
+            
+            # 允许继续的条件
+            if is_live is True or live_status == "is_live":
+                return True, None
+            
+            # 各种拒绝情况
+            if live_status == "is_upcoming":
+                return False, "LIVE_NOT_STARTED"
+            elif live_status == "was_live":
+                return False, "LIVE_ENDED" 
+            elif is_live is False:
+                return False, "NOT_LIVE"
+            else:
+                return False, "LIVE_STATUS_UNKNOWN"
+        
+        def build_error_json(live_info, code, session_id, url):
+            """构建错误JSON"""
+            return {
+                "type": "error",
+                "code": code,
+                "session_id": session_id,
+                "title": live_info.get('title'),
+                "live_status": live_info.get('live_status'),
+                "url": url,
+                "release_timestamp": live_info.get('release_timestamp'),
+                "message": {
+                    "NOT_LIVE": "不是直播视频",
+                    "LIVE_NOT_STARTED": "直播未开始",
+                    "LIVE_ENDED": "直播已结束",
+                    "LIVE_STATUS_UNKNOWN": "无法确定直播状态"
+                }.get(code, "直播状态检查失败")
+            }
+        
+        # 验证直播状态
+        is_valid, error_code = is_live_valid(live_info)
+        if not is_valid:
+            logging.warning(f"🔍 Live status check failed: {error_code}")
+            error_json = build_error_json(live_info, error_code, session_id, youtube_url)
+            
+            # 通过 stream_queue 发送错误信息
+            await stream_queue.put(StreamData(data_type="error", content=json.dumps(error_json, ensure_ascii=False)))
+            
+            # 发送 FinishSession 并结束
+            try:
+                finish_request = TranslateRequestData(
+                    session_id=session_id,
+                    event="Type_FinishSession",
+                    source_audio=Audio()
+                )
+                event_logger.log_send_event(Type.FinishSession, finish_request)
+                await send_request(conn, finish_request)
+                logging.info("FinishSession sent due to invalid live status")
+            except Exception as e:
+                logging.error(f"Error sending FinishSession: {e}")
+            
+            # 直接yield错误并返回
+            yield StreamData(data_type="error", content=json.dumps(error_json, ensure_ascii=False))
+            return
+        
+        logging.info(f"🔍 Live status check passed: {live_info}")
+        live_check_passed_event.set()  # 设置直播检查通过事件
+        
+        # Start silence bridge immediately (修改为等待两个事件的组合)
         silence_task = asyncio.create_task(
-            send_silence_until_ready(conn, session_id, audio_ready_event, timeout_seconds=18)
+            send_silence_until_ready_with_live_check(conn, session_id, audio_ready_event, live_check_passed_event, timeout_seconds=18)
         )
         
         async def send_pcm_chunks():
@@ -1442,6 +1635,20 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     
                     chunk_count += 1
                     total_bytes += len(chunk)
+                    
+                    # Codex方案核心：检查是否允许发送真实PCM（两阶段门控）
+                    audio_ready = audio_ready_event.is_set()
+                    live_check_passed = live_check_passed_event.is_set()
+                    
+                    if not (audio_ready and live_check_passed):
+                        # 条件未满足，丢弃这个PCM帧但保持管道畅通
+                        if chunk_count % 50 == 0:
+                            logging.info(f"🚫 Discarding PCM chunk {chunk_count} (waiting for audio_ready={audio_ready} AND live_check_passed={live_check_passed})")
+                        continue  # 继续读取下一个chunk但不发送
+                    
+                    # 条件满足，发送真实PCM
+                    if chunk_count == 1:
+                        logging.info(f"🎵 First real PCM chunk transmission started (chunk #{chunk_count})")
                     
                     # Log every 50 chunks (about 1 second of audio)
                     if chunk_count % 50 == 0:
