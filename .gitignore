@@ -44,3 +44,6 @@ logs/
 *.mp3
 *.mp4
 *.ts
+
+mye/
+myeclear/
