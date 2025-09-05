@@ -1538,10 +1538,12 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         ffmpeg_ready_time = time.monotonic()
         logging.info(f"🎵 FFmpeg ready in {ffmpeg_ready_time - parallel_start_time:.2f}s")
         
-        # Phase 6: 立即启动PCM读取任务（在检查完成前丢弃，确保audio_ready_event尽早触发）
+        # Phase 6: 🔥关键修复 - 立即启动PCM读取任务（避免管道阻塞）
         logging.info("🎵 Starting PCM reading immediately (discard mode until check passes)...")
+        sender_task = asyncio.create_task(send_pcm_chunks())
+        receiver_task = asyncio.create_task(receive_responses())
         
-        # Phase 7: 等待直播状态检查完成
+        # Phase 7: 等待直播状态检查完成（PCM已在后台运行）
         logging.info("🔍 Waiting for live status check...")
         live_info = await live_check_task
         check_ready_time = time.monotonic()
@@ -1598,6 +1600,36 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             logging.warning(f"🔍 Live status check failed: {error_code}")
             error_json = build_error_json(live_info, error_code, session_id, youtube_url)
             
+            # 🔥资源清理：取消已启动的任务
+            logging.info("🧹 Cleaning up resources due to invalid live status...")
+            silence_task.cancel()
+            sender_task.cancel()
+            receiver_task.cancel()
+            
+            try:
+                await silence_task
+            except asyncio.CancelledError:
+                logging.info("🔇 Silence task cancelled")
+                pass
+            except Exception as e:
+                logging.error(f"Error waiting for silence task: {e}")
+                
+            try:
+                await sender_task
+            except asyncio.CancelledError:
+                logging.info("🎵 Sender task cancelled")
+                pass
+            except Exception as e:
+                logging.error(f"Error waiting for sender task: {e}")
+                
+            try:
+                await receiver_task
+            except asyncio.CancelledError:
+                logging.info("📡 Receiver task cancelled")
+                pass
+            except Exception as e:
+                logging.error(f"Error waiting for receiver task: {e}")
+            
             # 发送 FinishSession 并结束
             try:
                 finish_request = TranslateRequestData(
@@ -1611,7 +1643,17 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             except Exception as e:
                 logging.error(f"Error sending FinishSession: {e}")
             
-            # 🔥审核者建议：删除冗余的stream_queue.put，直接yield错误并返回
+            # 🔥资源清理：关闭连接
+            try:
+                await conn.close()
+                logging.info("🔗 WebSocket connection closed")
+            except Exception as e:
+                logging.error(f"Error closing connection: {e}")
+            
+            # 🔥资源清理：清理流媒体资源  
+            await streamer.cleanup()
+            logging.info("🧹 Streamer cleanup completed")
+            
             yield StreamData(data_type="error", content=json.dumps(error_json, ensure_ascii=False))
             return
         
@@ -1796,9 +1838,8 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                 logging.error(f"Receive message traceback: {traceback.format_exc()}")
                 finished.set()
         
-        # Start sender and receiver tasks
-        sender_task = asyncio.create_task(send_pcm_chunks())
-        receiver_task = asyncio.create_task(receive_responses())
+        # 🔥任务已在Phase 6中启动，这里不需要重复创建
+        # sender_task and receiver_task already started in Phase 6
         
         # Yield stream data (audio and subtitles) as they arrive
         try:
