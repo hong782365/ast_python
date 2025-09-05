@@ -237,9 +237,8 @@ class AudioStreamPublisher:
         if session.stop_event:
             session.stop_event.set()
         
-        # Cancel the task if it exists
-        if session.task and not session.task.done():
-            session.task.cancel()
+        # ❗ 关键修复：不要立即取消任务！让宽限期监督协程来处理
+        # 只设置停止信号，任务会自然完成 FinishSession 流程后结束
         
         # Update status immediately (立即返回 - 不等待任务完成)
         session.status = "stopping"
@@ -283,6 +282,10 @@ class AudioStreamPublisher:
                     session.status = "stopped"
                     if session.task and not session.task.done():
                         session.task.cancel()
+                except asyncio.CancelledError:
+                    # 任务被取消（正常的强制停止流程）
+                    self.logger.info(f"Session {session_id}: Task was cancelled during grace period")
+                    session.status = "stopped"
                 except Exception as e:
                     # 任务执行异常
                     self.logger.error(f"Session {session_id}: Task ended with exception: {e}")
