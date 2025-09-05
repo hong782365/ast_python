@@ -1500,33 +1500,55 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
     live_check_passed_event = asyncio.Event()  # 直播检查通过
     
     try:
-        # Start three tasks in parallel (Codex方案核心改动)
-        logging.info("🚀 Starting parallel initialization: ffmpeg + WebSocket + live check...")
+        # 按审核者建议：分阶段启动，确保延迟最优
+        logging.info("🚀 Starting optimized parallel initialization...")
         parallel_start_time = time.monotonic()
         
-        # Task 1: Start ffmpeg streaming pipeline
-        ffmpeg_task = asyncio.create_task(streamer.start_streaming_pipeline())
-        
-        # Task 2: Connect WebSocket and start session
+        # Phase 1: 启动WebSocket建联任务（优先级最高，需要立即获得conn）
         websocket_task = asyncio.create_task(
             connect_websocket_and_start_session(conf, SOURCE_LANGUAGE, TARGET_LANGUAGE, event_logger)
         )
         
-        # Task 3: Check live status (新增)
+        # Phase 2: 并行启动其他任务（无需立即等待）
+        ffmpeg_task = asyncio.create_task(streamer.start_streaming_pipeline())
         live_check_task = asyncio.create_task(ytdlp_manager.check_live_status(youtube_url))
         
-        # Wait for all three to complete
-        pcm_stream, (conn, session_id, log_id, ws_connect_duration), live_info = await asyncio.gather(
-            ffmpeg_task, websocket_task, live_check_task
-        )
+        # Phase 3: 优先等待WebSocket建联完成（获得conn以便立即启动静音桥）
+        logging.info("🔗 Waiting for WebSocket connection...")
+        conn, session_id, log_id, ws_connect_duration = await websocket_task
+        websocket_ready_time = time.monotonic()
         
-        parallel_duration = time.monotonic() - parallel_start_time
-        logging.info(f"🚀 Parallel initialization completed in {parallel_duration:.2f}s")
-        logging.info(f"📊 WebSocket connect duration: {ws_connect_duration:.2f}s")
+        logging.info(f"🔗 WebSocket ready in {websocket_ready_time - parallel_start_time:.2f}s (log_id={log_id})")
         
         # Create queues for communication (需要提前创建，用于错误处理)
         stream_queue = asyncio.Queue()  # Queue for both audio and subtitle data
         finished = asyncio.Event()
+        
+        # Phase 4: 🔥关键修复 - 立即启动静音桥（避免等包超时）
+        logging.info("🔇 Starting silence bridge immediately to prevent timeout...")
+        silence_task = asyncio.create_task(
+            send_silence_until_ready_with_live_check(
+                conn, session_id, audio_ready_event, live_check_passed_event, timeout_seconds=18
+            )
+        )
+        
+        # Phase 5: 等待FFmpeg就绪并立即启动PCM读取（丢弃模式直到检查通过）
+        logging.info("🎵 Waiting for FFmpeg to be ready...")
+        pcm_stream = await ffmpeg_task
+        ffmpeg_ready_time = time.monotonic()
+        logging.info(f"🎵 FFmpeg ready in {ffmpeg_ready_time - parallel_start_time:.2f}s")
+        
+        # Phase 6: 立即启动PCM读取任务（在检查完成前丢弃，确保audio_ready_event尽早触发）
+        logging.info("🎵 Starting PCM reading immediately (discard mode until check passes)...")
+        
+        # Phase 7: 等待直播状态检查完成
+        logging.info("🔍 Waiting for live status check...")
+        live_info = await live_check_task
+        check_ready_time = time.monotonic()
+        logging.info(f"🔍 Live check completed in {check_ready_time - parallel_start_time:.2f}s")
+        
+        parallel_duration = time.monotonic() - parallel_start_time
+        logging.info(f"🚀 All initialization completed in {parallel_duration:.2f}s")
         
         # 检查直播状态 (Codex方案核心逻辑)
         def is_live_valid(live_info):
@@ -1576,9 +1598,6 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             logging.warning(f"🔍 Live status check failed: {error_code}")
             error_json = build_error_json(live_info, error_code, session_id, youtube_url)
             
-            # 通过 stream_queue 发送错误信息
-            await stream_queue.put(StreamData(data_type="error", content=json.dumps(error_json, ensure_ascii=False)))
-            
             # 发送 FinishSession 并结束
             try:
                 finish_request = TranslateRequestData(
@@ -1592,17 +1611,12 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
             except Exception as e:
                 logging.error(f"Error sending FinishSession: {e}")
             
-            # 直接yield错误并返回
+            # 🔥审核者建议：删除冗余的stream_queue.put，直接yield错误并返回
             yield StreamData(data_type="error", content=json.dumps(error_json, ensure_ascii=False))
             return
         
         logging.info(f"🔍 Live status check passed: {live_info}")
         live_check_passed_event.set()  # 设置直播检查通过事件
-        
-        # Start silence bridge immediately (修改为等待两个事件的组合)
-        silence_task = asyncio.create_task(
-            send_silence_until_ready_with_live_check(conn, session_id, audio_ready_event, live_check_passed_event, timeout_seconds=18)
-        )
         
         async def send_pcm_chunks():
             chunk_count = 0

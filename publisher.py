@@ -490,6 +490,11 @@ class AudioStreamPublisher:
                     self.logger.warning(f"Session {session.session_id}: Live check failed, sending error to client")
                     await ws_client.send_text_message(stream_data.content)
                     self.logger.info(f"Session {session.session_id}: Error message sent: {stream_data.content}")
+                    
+                    # 🔥审核者建议：检查失败时标记会话状态为failed
+                    session.status = "failed"
+                    self.logger.info(f"Session {session.session_id}: Status set to 'failed' due to live check failure")
+                    
                     # Error已发送，流程即将结束
                     break
                 
