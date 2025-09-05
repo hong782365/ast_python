@@ -1528,138 +1528,11 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         logging.info("🔇 Starting silence bridge immediately to prevent timeout...")
         silence_task = asyncio.create_task(
             send_silence_until_ready_with_live_check(
-                conn, session_id, audio_ready_event, live_check_passed_event, timeout_seconds=18
+                conn, session_id, audio_ready_event, live_check_passed_event, timeout_seconds=30
             )
         )
         
-        # Phase 5: 等待FFmpeg就绪并立即启动PCM读取（丢弃模式直到检查通过）
-        logging.info("🎵 Waiting for FFmpeg to be ready...")
-        pcm_stream = await ffmpeg_task
-        ffmpeg_ready_time = time.monotonic()
-        logging.info(f"🎵 FFmpeg ready in {ffmpeg_ready_time - parallel_start_time:.2f}s")
-        
-        # Phase 6: 🔥关键修复 - 立即启动PCM读取任务（避免管道阻塞）
-        logging.info("🎵 Starting PCM reading immediately (discard mode until check passes)...")
-        sender_task = asyncio.create_task(send_pcm_chunks())
-        receiver_task = asyncio.create_task(receive_responses())
-        
-        # Phase 7: 等待直播状态检查完成（PCM已在后台运行）
-        logging.info("🔍 Waiting for live status check...")
-        live_info = await live_check_task
-        check_ready_time = time.monotonic()
-        logging.info(f"🔍 Live check completed in {check_ready_time - parallel_start_time:.2f}s")
-        
-        parallel_duration = time.monotonic() - parallel_start_time
-        logging.info(f"🚀 All initialization completed in {parallel_duration:.2f}s")
-        
-        # 检查直播状态 (Codex方案核心逻辑)
-        def is_live_valid(live_info):
-            """判断直播状态是否有效"""
-            # 如果检查过程出错，直接拒绝
-            if live_info.get('error'):
-                return False, "LIVE_STATUS_UNKNOWN"
-            
-            is_live = live_info.get('is_live')
-            live_status = live_info.get('live_status')
-            
-            # 允许继续的条件
-            if is_live is True or live_status == "is_live":
-                return True, None
-            
-            # 各种拒绝情况
-            if live_status == "is_upcoming":
-                return False, "LIVE_NOT_STARTED"
-            elif live_status == "was_live":
-                return False, "LIVE_ENDED" 
-            elif is_live is False:
-                return False, "NOT_LIVE"
-            else:
-                return False, "LIVE_STATUS_UNKNOWN"
-        
-        def build_error_json(live_info, code, session_id, url):
-            """构建错误JSON"""
-            return {
-                "type": "error",
-                "code": code,
-                "session_id": session_id,
-                "title": live_info.get('title'),
-                "live_status": live_info.get('live_status'),
-                "url": url,
-                "release_timestamp": live_info.get('release_timestamp'),
-                "message": {
-                    "NOT_LIVE": "不是直播视频",
-                    "LIVE_NOT_STARTED": "直播未开始",
-                    "LIVE_ENDED": "直播已结束",
-                    "LIVE_STATUS_UNKNOWN": "无法确定直播状态"
-                }.get(code, "直播状态检查失败")
-            }
-        
-        # 验证直播状态
-        is_valid, error_code = is_live_valid(live_info)
-        if not is_valid:
-            logging.warning(f"🔍 Live status check failed: {error_code}")
-            error_json = build_error_json(live_info, error_code, session_id, youtube_url)
-            
-            # 🔥资源清理：取消已启动的任务
-            logging.info("🧹 Cleaning up resources due to invalid live status...")
-            silence_task.cancel()
-            sender_task.cancel()
-            receiver_task.cancel()
-            
-            try:
-                await silence_task
-            except asyncio.CancelledError:
-                logging.info("🔇 Silence task cancelled")
-                pass
-            except Exception as e:
-                logging.error(f"Error waiting for silence task: {e}")
-                
-            try:
-                await sender_task
-            except asyncio.CancelledError:
-                logging.info("🎵 Sender task cancelled")
-                pass
-            except Exception as e:
-                logging.error(f"Error waiting for sender task: {e}")
-                
-            try:
-                await receiver_task
-            except asyncio.CancelledError:
-                logging.info("📡 Receiver task cancelled")
-                pass
-            except Exception as e:
-                logging.error(f"Error waiting for receiver task: {e}")
-            
-            # 发送 FinishSession 并结束
-            try:
-                finish_request = TranslateRequestData(
-                    session_id=session_id,
-                    event="Type_FinishSession",
-                    source_audio=Audio()
-                )
-                event_logger.log_send_event(Type.FinishSession, finish_request)
-                await send_request(conn, finish_request)
-                logging.info("FinishSession sent due to invalid live status")
-            except Exception as e:
-                logging.error(f"Error sending FinishSession: {e}")
-            
-            # 🔥资源清理：关闭连接
-            try:
-                await conn.close()
-                logging.info("🔗 WebSocket connection closed")
-            except Exception as e:
-                logging.error(f"Error closing connection: {e}")
-            
-            # 🔥资源清理：清理流媒体资源  
-            await streamer.cleanup()
-            logging.info("🧹 Streamer cleanup completed")
-            
-            yield StreamData(data_type="error", content=json.dumps(error_json, ensure_ascii=False))
-            return
-        
-        logging.info(f"🔍 Live status check passed: {live_info}")
-        live_check_passed_event.set()  # 设置直播检查通过事件
-        
+        # 🔥关键修复：在使用前定义函数避免NameError
         async def send_pcm_chunks():
             chunk_count = 0
             total_bytes = 0
@@ -1837,6 +1710,138 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                 import traceback
                 logging.error(f"Receive message traceback: {traceback.format_exc()}")
                 finished.set()
+        
+        # Phase 5: 等待FFmpeg就绪并立即启动PCM读取（丢弃模式直到检查通过）
+        logging.info("🎵 Waiting for FFmpeg to be ready...")
+        pcm_stream = await ffmpeg_task
+        ffmpeg_ready_time = time.monotonic()
+        logging.info(f"🎵 FFmpeg ready in {ffmpeg_ready_time - parallel_start_time:.2f}s")
+        
+        # Phase 6: 🔥关键修复 - 立即启动PCM读取任务（避免管道阻塞）
+        logging.info("🎵 Starting PCM reading immediately (discard mode until check passes)...")
+        sender_task = asyncio.create_task(send_pcm_chunks())
+        receiver_task = asyncio.create_task(receive_responses())
+        
+        # Phase 7: 等待直播状态检查完成（PCM已在后台运行）
+        logging.info("🔍 Waiting for live status check...")
+        live_info = await live_check_task
+        check_ready_time = time.monotonic()
+        logging.info(f"🔍 Live check completed in {check_ready_time - parallel_start_time:.2f}s")
+        
+        parallel_duration = time.monotonic() - parallel_start_time
+        logging.info(f"🚀 All initialization completed in {parallel_duration:.2f}s")
+        
+        # 检查直播状态 (Codex方案核心逻辑)
+        def is_live_valid(live_info):
+            """判断直播状态是否有效"""
+            # 如果检查过程出错，直接拒绝
+            if live_info.get('error'):
+                return False, "LIVE_STATUS_UNKNOWN"
+            
+            is_live = live_info.get('is_live')
+            live_status = live_info.get('live_status')
+            
+            # 允许继续的条件
+            if is_live is True or live_status == "is_live":
+                return True, None
+            
+            # 各种拒绝情况
+            if live_status == "is_upcoming":
+                return False, "LIVE_NOT_STARTED"
+            elif live_status == "was_live":
+                return False, "LIVE_ENDED" 
+            elif is_live is False:
+                return False, "NOT_LIVE"
+            else:
+                return False, "LIVE_STATUS_UNKNOWN"
+        
+        def build_error_json(live_info, code, session_id, url):
+            """构建错误JSON"""
+            return {
+                "type": "error",
+                "code": code,
+                "session_id": session_id,
+                "title": live_info.get('title'),
+                "live_status": live_info.get('live_status'),
+                "url": url,
+                "release_timestamp": live_info.get('release_timestamp'),
+                "message": {
+                    "NOT_LIVE": "不是直播视频",
+                    "LIVE_NOT_STARTED": "直播未开始",
+                    "LIVE_ENDED": "直播已结束",
+                    "LIVE_STATUS_UNKNOWN": "无法确定直播状态"
+                }.get(code, "直播状态检查失败")
+            }
+        
+        # 验证直播状态
+        is_valid, error_code = is_live_valid(live_info)
+        if not is_valid:
+            logging.warning(f"🔍 Live status check failed: {error_code}")
+            error_json = build_error_json(live_info, error_code, session_id, youtube_url)
+            
+            # 🔥资源清理：取消已启动的任务
+            logging.info("🧹 Cleaning up resources due to invalid live status...")
+            silence_task.cancel()
+            sender_task.cancel()
+            receiver_task.cancel()
+            
+            try:
+                await silence_task
+            except asyncio.CancelledError:
+                logging.info("🔇 Silence task cancelled")
+                pass
+            except Exception as e:
+                logging.error(f"Error waiting for silence task: {e}")
+                
+            try:
+                await sender_task
+            except asyncio.CancelledError:
+                logging.info("🎵 Sender task cancelled")
+                pass
+            except Exception as e:
+                logging.error(f"Error waiting for sender task: {e}")
+                
+            try:
+                await receiver_task
+            except asyncio.CancelledError:
+                logging.info("📡 Receiver task cancelled")
+                pass
+            except Exception as e:
+                logging.error(f"Error waiting for receiver task: {e}")
+            
+            # 发送 FinishSession 并结束
+            try:
+                finish_request = TranslateRequestData(
+                    session_id=session_id,
+                    event="Type_FinishSession",
+                    source_audio=Audio()
+                )
+                event_logger.log_send_event(Type.FinishSession, finish_request)
+                await send_request(conn, finish_request)
+                logging.info("FinishSession sent due to invalid live status")
+            except Exception as e:
+                logging.error(f"Error sending FinishSession: {e}")
+            
+            # 🔥资源清理：关闭连接
+            try:
+                await conn.close()
+                logging.info("🔗 WebSocket connection closed")
+            except Exception as e:
+                logging.error(f"Error closing connection: {e}")
+            
+            # 🔥资源清理：清理流媒体资源  
+            await streamer.cleanup()
+            logging.info("🧹 Streamer cleanup completed")
+            
+            yield StreamData(data_type="error", content=json.dumps(error_json, ensure_ascii=False))
+            return
+        
+        logging.info(f"🔍 Live status check passed: {live_info}")
+        live_check_passed_event.set()  # 设置直播检查通过事件
+        
+        # 🔥函数定义已移动到Phase 5之前避免NameError
+        
+        # 🔥函数定义已移动到Phase 5之前避免NameError
         
         # 🔥任务已在Phase 6中启动，这里不需要重复创建
         # sender_task and receiver_task already started in Phase 6
