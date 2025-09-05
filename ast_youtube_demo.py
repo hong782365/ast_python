@@ -1370,7 +1370,7 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
             logging.info(f"📊 Final FFmpeg status: still running (PID: {ffmpeg_process.pid})")
             print(f"📊 CLOUDFLARE_LOG: Final FFmpeg status - Still running (PID: {ffmpeg_process.pid})", file=sys.stderr, flush=True)
 
-async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None):
+async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None, stop_event: Optional[asyncio.Event] = None, finish_grace_timeout: float = 30.0):
     """Generator function that yields translated audio chunks from YouTube live stream"""
     streamer = YouTubeLiveStreamer(youtube_url, duration_seconds or 3600)  # Default 1 hour
     
@@ -1414,6 +1414,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         async def send_pcm_chunks():
             chunk_count = 0
             total_bytes = 0
+            finish_sent = False  # 防止重复发送FinishSession
             try:
                 logging.info("Starting to read PCM chunks from ffmpeg...")
                 
@@ -1430,6 +1431,11 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     audio_ready_event=audio_ready_event,
                     ffmpeg_spawn_time=streamer.ffmpeg_spawn_time
                 ):
+                    # 检查是否需要停止（外部stop请求）
+                    if stop_event and stop_event.is_set():
+                        logging.info(f"Stop event detected at chunk {chunk_count}, sending FinishSession and continuing to receive...")
+                        break
+                    
                     if not chunk:
                         logging.info("No more PCM chunks available")
                         break
@@ -1458,29 +1464,57 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                 
                 logging.info(f"Finished sending {chunk_count} PCM chunks, total {total_bytes} bytes")
                 
-                # Send finish session
-                finish_request = TranslateRequestData(
-                    session_id=session_id,
-                    event="Type_FinishSession",
-                    source_audio=Audio()
-                )
-                
-                # 记录发送FinishSession事件
-                event_logger.log_send_event(Type.FinishSession, finish_request)
-                
-                await send_request(conn, finish_request)
-                logging.info("FinishSession request sent.")
-                
             except Exception as e:
                 logging.error(f"Error sending PCM chunks: {e}")
                 import traceback
                 logging.error(f"Send chunks traceback: {traceback.format_exc()}")
-                finished.set()
+            finally:
+                # 无论如何都要发送 FinishSession（自然结束或外部停止）
+                if not finish_sent:
+                    try:
+                        finish_request = TranslateRequestData(
+                            session_id=session_id,
+                            event="Type_FinishSession",
+                            source_audio=Audio()
+                        )
+                        
+                        # 记录发送FinishSession事件
+                        event_logger.log_send_event(Type.FinishSession, finish_request)
+                        
+                        await send_request(conn, finish_request)
+                        finish_sent = True
+                        logging.info("FinishSession request sent.")
+                    except Exception as e:
+                        logging.error(f"Error sending FinishSession: {e}")
+                        # 即使FinishSession发送失败，也要设置finished避免无限等待
+                        finished.set()
         
         async def receive_responses():
+            grace_period_start = None
             try:
                 while not finished.is_set():
-                    resp = await receive_message(conn)
+                    try:
+                        # 如果处于宽限期，使用较短的超时
+                        timeout = 2.0 if grace_period_start else None
+                        if timeout:
+                            resp = await asyncio.wait_for(receive_message(conn), timeout=timeout)
+                        else:
+                            resp = await receive_message(conn)
+                    except asyncio.TimeoutError:
+                        # 宽限期超时检查
+                        if grace_period_start:
+                            elapsed = time.time() - grace_period_start
+                            if elapsed >= finish_grace_timeout:
+                                logging.warning(f"Grace period timeout ({finish_grace_timeout}s), ending receive loop")
+                                finished.set()
+                                break
+                            else:
+                                logging.debug(f"Grace period active: {elapsed:.1f}s/{finish_grace_timeout}s")
+                                continue
+                        else:
+                            # 不应该发生（没有超时设置却超时了）
+                            logging.warning("Unexpected receive timeout")
+                            continue
                     
                     # 记录接收到的事件
                     event_logger.log_receive_event(resp)
@@ -1500,15 +1534,35 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                         finished.set()
                         break
                     
+                    # 检查是否进入宽限期（外部停止且收到UsageResponse）
+                    if stop_event and stop_event.is_set() and resp.event == Type.UsageResponse:
+                        if grace_period_start is None:
+                            grace_period_start = time.time()
+                            logging.info(f"Entered FinishSession grace period ({finish_grace_timeout}s) after receiving UsageResponse")
+                    
                     # Handle subtitle events (650-655)
                     subtitle_json = map_event_to_subtitle_json(resp)
                     if subtitle_json:
                         await stream_queue.put(StreamData(data_type="subtitle", content=subtitle_json))
                         logging.debug(f"Queued subtitle: {subtitle_json}")
                     
-                    # Handle TTS audio data
+                    # Handle TTS audio data and text responses
                     if resp.data:
                         await stream_queue.put(StreamData(data_type="audio", content=resp.data))
+                    
+                    # 将重要的响应事件（如 UsageResponse）作为字幕转发
+                    if resp.event in [Type.UsageResponse, Type.SessionFinished]:
+                        response_info = {
+                            "type": "system_event", 
+                            "event": resp.event.name if hasattr(resp.event, 'name') else str(resp.event),
+                            "message": resp.message if resp.message else None
+                        }
+                        if resp.event == Type.UsageResponse and resp.billing:
+                            response_info["billing"] = {
+                                "duration_msec": resp.billing.duration_msec,
+                                "items": [{"unit": item.unit, "quantity": item.quantity} for item in resp.billing.items] if resp.billing.items else []
+                            }
+                        await stream_queue.put(StreamData(data_type="subtitle", content=json.dumps(response_info, ensure_ascii=False)))
                         
             except Exception as e:
                 logging.error(f"Receive message error: {e}")

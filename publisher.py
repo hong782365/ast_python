@@ -242,10 +242,10 @@ class AudioStreamPublisher:
             session.task.cancel()
         
         # Update status immediately (立即返回 - 不等待任务完成)
-        session.status = "stopped"
+        session.status = "stopping"
         
-        # 触发后台清理，不阻塞返回，传递会话对象避免竞态
-        asyncio.create_task(self._background_cleanup(session))
+        # 启动宽限期监督协程，不阻塞返回
+        asyncio.create_task(self._grace_period_supervisor(session))
         
         return True
     
@@ -261,6 +261,46 @@ class AudioStreamPublisher:
         except Exception as e:
             self.logger.warning(f"Error in session auto-cleanup for {session_id}: {e}")
     
+    async def _grace_period_supervisor(self, session: PublisherSession):
+        """宽限期监督协程：在FinishSession宽限期内监视会话，超时则强制清理"""
+        session_id = session.session_id
+        # 从环境变量获取宽限期时长
+        grace_timeout = float(os.getenv("FINISH_GRACE_TIMEOUT", "30.0"))
+        
+        try:
+            self.logger.info(f"Grace period supervisor started for session {session_id} (timeout: {grace_timeout}s)")
+            
+            # 等待宽限期时长或直到任务完成
+            if session.task:
+                try:
+                    await asyncio.wait_for(session.task, timeout=grace_timeout)
+                    # 任务在宽限期内正常完成
+                    self.logger.info(f"Session {session_id} completed gracefully within {grace_timeout}s")
+                    session.status = "completed"
+                except asyncio.TimeoutError:
+                    # 宽限期超时，强制清理
+                    self.logger.warning(f"Session {session_id}: Grace period timeout ({grace_timeout}s), forcing cleanup")
+                    session.status = "stopped"
+                    if session.task and not session.task.done():
+                        session.task.cancel()
+                except Exception as e:
+                    # 任务执行异常
+                    self.logger.error(f"Session {session_id}: Task ended with exception: {e}")
+                    session.status = "failed"
+            else:
+                # 没有任务对象，直接等待后清理
+                await asyncio.sleep(grace_timeout)
+                self.logger.warning(f"Session {session_id}: No task found, cleanup after timeout")
+                session.status = "stopped"
+            
+            # 执行后台清理
+            await self._background_cleanup(session)
+            
+        except Exception as e:
+            self.logger.error(f"Grace period supervisor error for session {session_id}: {e}")
+            session.status = "failed"
+            await self._background_cleanup(session)
+
     async def _background_cleanup(self, session: PublisherSession):
         """后台清理器：先断连再等待，避免阻塞stop接口"""
         session_id = session.session_id
@@ -419,12 +459,17 @@ class AudioStreamPublisher:
     async def _stream_translated_audio(self, config: Config, session: PublisherSession, ws_client):
         """Stream translated PCM audio and subtitles to WebSocket publisher"""
         try:
-            async for stream_data in translate_youtube_live_stream(config, session.youtube_url):
-                # Check if stop was requested
-                if session.stop_event and session.stop_event.is_set():
-                    self.logger.info(f"Session {session.session_id}: Stop requested, terminating stream")
-                    break
-                
+            # 获取环境变量配置的宽限期时长
+            finish_grace_timeout = float(os.getenv("FINISH_GRACE_TIMEOUT", "30.0"))  # 默认30秒
+            
+            # Start YouTube live translation stream with stop control
+            async for stream_data in translate_youtube_live_stream(
+                config, 
+                session.youtube_url, 
+                stop_event=session.stop_event,
+                finish_grace_timeout=finish_grace_timeout
+            ):
+                # 无条件转发所有流数据，包括 FinishSession 的响应
                 if not stream_data:
                     break
                 
