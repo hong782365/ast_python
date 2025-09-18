@@ -18,6 +18,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# 配置日志系统
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
 logging.info("🚀 Publisher script starting...")
 
 try:
@@ -643,10 +649,6 @@ async def get_sessions():
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
     
     try:
         # host = os.getenv("HOST", "0.0.0.0")
