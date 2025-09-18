@@ -1558,7 +1558,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         logging.info(f"🎵 FFmpeg ready in {ffmpeg_ready_time - parallel_start_time:.2f}s")
         
         # Phase 6: 🔥关键修复 - 立即启动PCM读取任务（避免管道阻塞）
-        logging.info("🎵 Starting PCM reading immediately (discard mode until check passes)...")
+        logging.info("🎵 Starting PCM reading immediately (discard mode until audio ready)...")
         sender_task = asyncio.create_task(send_pcm_chunks())
         receiver_task = asyncio.create_task(receive_responses())
         

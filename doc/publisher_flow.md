@@ -80,7 +80,6 @@
       - 通过 `YtDlpManager.extract_stream_url()` 提取直播音频直链（线程池执行，支持 warmup）。
       - 根据环境（Cloudflare/本地）选择日志策略。
       - 组装 FFmpeg 命令，启用低延迟参数（`-fflags nobuffer` 等），从直链抓流输出 16kHz mono PCM；记录 `ffmpeg_process`、`pcm_stream` 及 spawn 时间；启动日志/健康监控。
-    - 使用 yt-dlp 轻量查询直播状态，返回 `is_live`、`live_status`、`title` 等。
 - **Phase 3：等待翻译 WebSocket 准备就绪**
   - 先等待 Phase 1 完成，以便尽快发送静音桥数据。
   - 创建同步原语：`audio_ready_event`（首帧 PCM 就绪）。
@@ -160,7 +159,7 @@
 ## 9. 关键依赖与对象关系
 - `AudioStreamPublisher` 单例维护所有会话和任务引用。
 - `YouTubeLiveStreamer` 封装 yt-dlp + FFmpeg 管道，同时管理日志、健康监控与资源释放。
-- `YtDlpManager` 负责提取直播流直链、检查直播状态，生命周期由 FastAPI `lifespan` 保证。
+- `YtDlpManager` 负责提取直播流直链，生命周期由 FastAPI `lifespan` 保证。
 - `WebSocketPublishClient` 对接外部发布端；翻译服务的 WebSocket 由 `translate_youtube_live_stream` 内部维护。
 - `ASTEventLogger` 统一记录翻译请求/响应事件，方便排查。
 
@@ -172,7 +171,7 @@
    - 建立与 `publishUrl` 的 WebSocket 连接。
    - 调用 `translate_youtube_live_stream` 获取 `StreamData` 序列。
 5. `translate_youtube_live_stream` 内部：
-   - 并行建立翻译服务会话、启动 FFmpeg 拉流、检查直播状态。
+   - 并行建立翻译服务会话、启动 FFmpeg 拉流。
    - 静音桥保持翻译会话存活，首包到达后开始发送真实音频。
    - 不断读取翻译响应，依次 `yield` 音频/字幕/系统事件。
 6. `_stream_translated_audio` 消费 `StreamData`：
