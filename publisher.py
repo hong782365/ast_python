@@ -3,72 +3,28 @@
 # Import sys first for logging
 import sys
 import os
-
-# Basic startup logging - this should appear immediately
-print("🚀 [STARTUP] Publisher script starting...")
-print(f"🚀 [STARTUP] Python version: {sys.version}")
-print(f"🚀 [STARTUP] Current working directory: {os.getcwd()}")
-
-try:
-    import asyncio
-    import logging
-    import time
-    import json
-    import uuid
-    from pathlib import Path
-    from typing import Optional, Dict, Any
-    from dataclasses import dataclass
-    print("✅ [STARTUP] Basic imports successful")
-except Exception as e:
-    print(f"❌ [STARTUP] Basic imports failed: {e}")
-    sys.exit(1)
-
-try:
-    from fastapi import FastAPI, HTTPException
-    from pydantic import BaseModel
-    from contextlib import asynccontextmanager
-    print("✅ [STARTUP] FastAPI imports successful")
-except Exception as e:
-    print(f"❌ [STARTUP] FastAPI imports failed: {e}")
-    sys.exit(1)
-
-try:
-    import websockets
-    from websockets.exceptions import ConnectionClosed, WebSocketException
-    print("✅ [STARTUP] WebSocket imports successful")
-except Exception as e:
-    print(f"❌ [STARTUP] WebSocket imports failed: {e}")
-    sys.exit(1)
-
-try:
-    import uvicorn
-    print("✅ [STARTUP] Uvicorn import successful")
-except Exception as e:
-    print(f"❌ [STARTUP] Uvicorn import failed: {e}")
-    sys.exit(1)
-
-# Add the current directory to path for imports
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
-print(f"✅ [STARTUP] Added current directory to path: {current_dir}")
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-    print("✅ [STARTUP] dotenv loaded successfully")
-except Exception as e:
-    print(f"⚠️ [STARTUP] dotenv load warning (continuing): {e}")
-
-# Import modified youtube demo functions - this is most likely to fail
-try:
-    from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, StreamData, ytdlp_manager
-    print("✅ [STARTUP] YouTube demo imports successful")
-except Exception as e:
-    print(f"❌ [STARTUP] YouTube demo imports failed: {e}")
-    print(f"❌ [STARTUP] Available files in current directory: {list(os.listdir('.'))}")
-    sys.exit(1)
+import asyncio
+import logging
+import time
+from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
+import websockets
+from websockets.exceptions import ConnectionClosed, WebSocketException
+import uvicorn
+from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.info("🚀 Publisher script starting...")
+
+try:
+    from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, ytdlp_manager
+except Exception as e:
+    logging.error(f"❌ YouTube demo imports failed: {e}")
+    sys.exit(1)
 
 # Configuration
 APP_KEY = os.getenv("APP_KEY")
@@ -127,8 +83,6 @@ class PublisherSession:
     publish_url: str
     status: str
     created_at: float
-    websocket: Optional[Any] = None
-    streamer: Optional[YouTubeLiveStreamer] = None
     task: Optional[asyncio.Task] = None
     stop_event: Optional[asyncio.Event] = None
     publisher_ws: Optional[Any] = None  # WebSocket发布客户端引用，防止泄漏
@@ -138,7 +92,7 @@ class AudioStreamPublisher:
         self.sessions: Dict[str, PublisherSession] = {}
         self.logger = logging.getLogger(__name__)
         
-    async def start_publishing_session(self, session_id: str, youtube_url: str, publish_url: str) -> tuple[str, bool, int]:
+    async def start_publishing_session(self, session_id: str, youtube_url: str, publish_url: str) -> tuple[str, int]:
         """Start a new publishing session or return existing one (idempotent)"""
         # 一容器一链接：检查活跃会话状态
         active_statuses = ["initializing", "starting", "connected_to_publisher", "processing_audio"]
@@ -148,7 +102,7 @@ class AudioStreamPublisher:
             existing_session = self.sessions[session_id]
             if existing_session.status in active_statuses:
                 self.logger.info(f"Session {session_id} already running with status: {existing_session.status}")
-                return session_id, False, 202  # HTTP 202 Accepted - 已在跑，幂等
+                return session_id, 202  # HTTP 202 Accepted - 已在跑，幂等
             else:
                 # Session exists but is not active, remove it
                 self.logger.info(f"Removing inactive session {session_id} with status: {existing_session.status}")
@@ -162,7 +116,7 @@ class AudioStreamPublisher:
         if active_sessions:
             active_session = active_sessions[0]
             self.logger.warning(f"Container busy with active session {active_session.session_id} (status: {active_session.status})")
-            return session_id, False, 409  # HTTP 409 Conflict - 容器忙碌
+            return session_id, 409  # HTTP 409 Conflict - 容器忙碌
         
         # Create new session
         stop_event = asyncio.Event()
@@ -184,7 +138,7 @@ class AudioStreamPublisher:
         # 添加任务完成回调，自动清理会话（避免内存泄漏）
         task.add_done_callback(lambda task_obj: self._schedule_session_cleanup(session_id))
         
-        return session_id, True, 201  # HTTP 201 Created - 新会话创建成功
+        return session_id, 201  # HTTP 201 Created - 新会话创建成功
     
     async def stop_publishing_session(self, session_id: str) -> bool:
         """Stop a publishing session (idempotent)"""
@@ -289,13 +243,6 @@ class AudioStreamPublisher:
                 except Exception as e:
                     self.logger.warning(f"Error initiating publisher WebSocket disconnect: {e}")
             
-            # 关闭streamer (FFmpeg进程等)
-            if session.streamer:
-                try:
-                    cleanup_tasks.append(asyncio.create_task(session.streamer.cleanup()))
-                    self.logger.info(f"Session {session_id}: Initiated streamer cleanup")
-                except Exception as e:
-                    self.logger.warning(f"Error initiating streamer cleanup: {e}")
             
             # Phase 2: 等待任务取消完成（有超时保护）
             if session.task and not session.task.done():
@@ -354,26 +301,12 @@ class AudioStreamPublisher:
             except asyncio.TimeoutError:
                 self.logger.warning(f"Session {session_id}: Task cancellation timeout in cleanup, forcing continue")
         
-        # Cleanup WebSocket connections
-        if session.websocket:
-            try:
-                await session.websocket.close()
-            except Exception as e:
-                self.logger.warning(f"Error closing WebSocket for session {session_id}: {e}")
-        
         # Cleanup publisher WebSocket connection
         if session.publisher_ws:
             try:
                 await session.publisher_ws.disconnect()
             except Exception as e:
                 self.logger.warning(f"Error disconnecting publisher WebSocket for session {session_id}: {e}")
-        
-        # Cleanup streamer
-        if session.streamer:
-            try:
-                await session.streamer.cleanup()
-            except Exception as e:
-                self.logger.warning(f"Error cleaning up streamer for session {session_id}: {e}")
         
         # 字典清理由后台清理器负责，这里只清理资源
         self.logger.info(f"Session {session_id} resources cleaned up (dict removal handled by background cleanup)")
@@ -625,7 +558,7 @@ async def start_ingest(request: IngestStartRequest):
             raise HTTPException(status_code=400, detail="Invalid WebSocket publish URL")
         
         # Start publishing session (idempotent)
-        session_id, is_new, status_code = await publisher.start_publishing_session(
+        session_id, status_code = await publisher.start_publishing_session(
             request.sessionId,
             request.youtube_url, 
             request.publishUrl

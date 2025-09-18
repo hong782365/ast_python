@@ -2,16 +2,14 @@ import asyncio
 import uuid
 import os
 import subprocess
-import signal
 import sys
 import time
 import logging
 import json
 import re
-import shutil
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Union
 import websockets
 from websockets import Headers
 from dotenv import load_dotenv
@@ -38,7 +36,7 @@ protogen_dir = os.path.join(current_dir, "python_protogen")
 sys.path.append(protogen_dir)
 
 # 现在可以直接导入所有模块
-from products.understanding.ast.ast_service_pb2 import TranslateRequest, ReqParams, TranslateResponse
+from products.understanding.ast.ast_service_pb2 import TranslateRequest, TranslateResponse
 from common.events_pb2 import Type
 
 # Configuration
@@ -637,7 +635,6 @@ class YouTubeLiveStreamer:
     def __init__(self, youtube_url: str, duration_seconds: int = 10):
         self.youtube_url = youtube_url
         self.duration_seconds = duration_seconds
-        self.yt_dlp_process = None
         self.ffmpeg_process = None
         self.ffmpeg_console_file = None
         self.log_dir = Path(current_dir) / "youtube" / "logs"
@@ -732,14 +729,10 @@ class YouTubeLiveStreamer:
             
             if is_cloudflare:
                 logging.info("🌐 Cloudflare mode: FFmpeg stderr will output directly to console")
-                print(f"🚀 CLOUDFLARE_LOG: Starting FFmpeg with direct stderr output", file=sys.stderr, flush=True)
-                print(f"🚀 CLOUDFLARE_LOG: FFmpeg command: {' '.join(ffmpeg_cmd)}", file=sys.stderr, flush=True)
             else:
                 logging.info(f"🏠 Local mode: FFmpeg logs to files")
                 logging.info(f"FFmpeg report log: {ffmpeg_report_log}")
                 logging.info(f"FFmpeg console log: {ffmpeg_console_log}")
-                print(f"🚀 CLOUDFLARE_LOG: FFmpeg report log: {ffmpeg_report_log}", file=sys.stderr, flush=True)
-                print(f"🚀 CLOUDFLARE_LOG: FFmpeg console log: {ffmpeg_console_log}", file=sys.stderr, flush=True)
             
             # Set up environment and file handles based on environment
             ffmpeg_start_time = time.time()
@@ -772,8 +765,7 @@ class YouTubeLiveStreamer:
             self.ffmpeg_console_file = ffmpeg_console_file
             
             # No need for yt-dlp process anymore
-            self.yt_dlp_process = None
-            
+                
             # Store the spawn timestamp for later timing calculation
             self.ffmpeg_spawn_time = time.monotonic()
             
@@ -784,17 +776,14 @@ class YouTubeLiveStreamer:
                 logging.error(f"FFmpeg process exited early with code: {self.ffmpeg_process.returncode}")
                 
                 # Output critical startup failure to stderr
-                print(f"🔴 CLOUDFLARE_ERROR: FFmpeg startup failed - Exit code: {self.ffmpeg_process.returncode}", file=sys.stderr, flush=True)
                 
                 if is_cloudflare:
                     # Cloudflare: stderr already went directly to console
                     logging.error("🌐 FFmpeg stderr should be visible above (direct output)")
-                    print(f"🔴 CLOUDFLARE_ERROR: FFmpeg stderr should be visible above (direct output)", file=sys.stderr, flush=True)
                     raise Exception(f"FFmpeg failed to start in Cloudflare environment, exit code: {self.ffmpeg_process.returncode}")
                 else:
                     # Local: Try to read console log file
                     logging.error(f"FFmpeg console log: {ffmpeg_console_log}")
-                    print(f"🔴 CLOUDFLARE_ERROR: Check FFmpeg console log: {ffmpeg_console_log}", file=sys.stderr, flush=True)
                     
                     try:
                         with open(ffmpeg_console_log, 'r') as f:
@@ -802,15 +791,12 @@ class YouTubeLiveStreamer:
                             if stderr_content.strip():
                                 logging.error(f"FFmpeg stderr from log file: {stderr_content}")
                                 # Output first 200 chars of error to stderr for immediate visibility
-                                print(f"🔴 CLOUDFLARE_ERROR: FFmpeg startup stderr - {stderr_content[:200]}...", file=sys.stderr, flush=True)
                     except Exception as e:
                         logging.error(f"Could not read ffmpeg console log: {e}")
-                        print(f"🔴 CLOUDFLARE_ERROR: Could not read FFmpeg console log - {e}", file=sys.stderr, flush=True)
                     
                     raise Exception(f"FFmpeg failed to start, check log file: {ffmpeg_console_log}")
             
             logging.info(f"FFmpeg process spawned successfully (PID: {self.ffmpeg_process.pid})")
-            print(f"✅ CLOUDFLARE_LOG: FFmpeg process spawned successfully - PID: {self.ffmpeg_process.pid}", file=sys.stderr, flush=True)
             
             # Start background monitoring tasks based on environment
             if is_cloudflare:
@@ -828,7 +814,6 @@ class YouTubeLiveStreamer:
             
         except Exception as e:
             logging.error(f"Failed to start streaming pipeline: {e}")
-            print(f"🔴 CLOUDFLARE_ERROR: Failed to start streaming pipeline - {e}", file=sys.stderr, flush=True)
             await self.cleanup()
             raise
     
@@ -841,7 +826,6 @@ class YouTubeLiveStreamer:
             
         logging.info(f"🔧 Starting FFmpeg console log monitor for PID {self.ffmpeg_process.pid}")
         logging.info(f"🔧 Monitoring log file: {console_log_path}")
-        print(f"🔧 CLOUDFLARE_LOG: FFmpeg console monitor started - PID {self.ffmpeg_process.pid}", file=sys.stderr, flush=True)
         
         try:
             line_count = 0
@@ -867,17 +851,15 @@ class YouTubeLiveStreamer:
                                         error_count += 1
                                         logging.error(f"🔴 FFmpeg ERROR: {line_str}")
                                         # Output critical errors to stderr for Cloudflare Workers Logs
-                                        print(f"🔴 CLOUDFLARE_ERROR: FFmpeg - {line_str}", file=sys.stderr, flush=True)
                                     elif "warning" in line_str.lower():
                                         warning_count += 1
                                         logging.warning(f"🟡 FFmpeg WARNING: {line_str}")
                                         # Output warnings to stderr for visibility
-                                        print(f"🟡 CLOUDFLARE_WARNING: FFmpeg - {line_str}", file=sys.stderr, flush=True)
                                     elif "connection" in line_str.lower() or "http" in line_str.lower():
                                         logging.info(f"🌐 FFmpeg NETWORK: {line_str}")
                                         # Output network issues to stderr as they're critical for debugging
                                         if any(keyword in line_str.lower() for keyword in ["timeout", "refused", "unreachable", "failed"]):
-                                            print(f"🌐 CLOUDFLARE_NETWORK: FFmpeg - {line_str}", file=sys.stderr, flush=True)
+                                            logging.error(f"🔴 FFmpeg NETWORK ERROR: {line_str}")
                                     elif any(keyword in line_str.lower() for keyword in ["duration", "time=", "bitrate", "fps"]):
                                         logging.debug(f"📊 FFmpeg PROGRESS: {line_str}")
                                     else:
@@ -888,7 +870,6 @@ class YouTubeLiveStreamer:
                     
                 except Exception as e:
                     logging.error(f"🔧 Error reading ffmpeg console log: {e}")
-                    print(f"🔧 CLOUDFLARE_ERROR: Error reading FFmpeg log - {e}", file=sys.stderr, flush=True)
                     await asyncio.sleep(2.0)  # Wait longer on error
             
             # Process has exited, read any remaining log content
@@ -896,7 +877,6 @@ class YouTubeLiveStreamer:
             logging.info(f"🔧 FFmpeg process exited with code: {final_exit_code}, total log lines processed: {line_count}")
             
             # Output exit status to stderr for Cloudflare Workers Logs
-            print(f"🔧 CLOUDFLARE_LOG: FFmpeg exited - Code: {final_exit_code}, Lines: {line_count}, Errors: {error_count}, Warnings: {warning_count}", file=sys.stderr, flush=True)
             
             # Read any final content from the log file
             try:
@@ -908,30 +888,25 @@ class YouTubeLiveStreamer:
                             logging.info(f"🔧 Final FFmpeg log content: {remaining_content}")
                             # Output final content if it contains errors
                             if any(keyword in remaining_content.lower() for keyword in ["error", "failed", "timeout"]):
-                                print(f"🔧 CLOUDFLARE_FINAL: FFmpeg final output - {remaining_content[:200]}...", file=sys.stderr, flush=True)
+                                logging.error(f"🔴 FFmpeg final error content: {remaining_content[:200]}...")
             except Exception as e:
                 logging.error(f"🔧 Error reading final log content: {e}")
-                print(f"🔧 CLOUDFLARE_ERROR: Error reading final log - {e}", file=sys.stderr, flush=True)
                 
         except Exception as e:
             logging.error(f"🔧 FFmpeg console log monitor error: {e}")
-            print(f"🔧 CLOUDFLARE_ERROR: FFmpeg monitor exception - {e}", file=sys.stderr, flush=True)
             import traceback
             logging.error(f"🔧 Monitor traceback: {traceback.format_exc()}")
         
         logging.info("🔧 FFmpeg console log monitor ended")
-        print("🔧 CLOUDFLARE_LOG: FFmpeg console monitor ended", file=sys.stderr, flush=True)
 
     async def _monitor_ffmpeg_health(self):
         """Monitor FFmpeg process health and network connectivity"""
         if not self.ffmpeg_process:
             logging.warning("💓 FFmpeg health monitor: No process available")
-            print("💓 CLOUDFLARE_WARNING: FFmpeg health monitor - No process available", file=sys.stderr, flush=True)
             return
             
         logging.info(f"💓 Starting FFmpeg health monitor for PID {self.ffmpeg_process.pid}")
         logging.info(f"💓 FFmpeg duration limit: {self.duration_seconds} seconds")
-        print(f"💓 CLOUDFLARE_LOG: FFmpeg health monitor started - PID {self.ffmpeg_process.pid}, Duration limit: {self.duration_seconds}s", file=sys.stderr, flush=True)
         
         check_count = 0
         start_time = time.time()
@@ -951,15 +926,14 @@ class YouTubeLiveStreamer:
                     
                     # Output health status to stderr for monitoring (every 5 checks = 2.5 minutes)
                     if check_count % 5 == 0:
-                        print(f"💓 CLOUDFLARE_LOG: FFmpeg health #{check_count} - CPU {cpu_percent:.1f}%, Memory {memory_info.rss/1024/1024:.1f}MB, Runtime {time.time() - start_time:.0f}s", file=sys.stderr, flush=True)
+                        logging.info(f"📊 FFmpeg health status: CPU {cpu_percent:.1f}%, Memory {memory_info.rss/1024/1024:.1f}MB")
                         
                 except ImportError:
                     logging.info(f"💓 FFmpeg health check #{check_count}: Process alive (psutil not available for detailed stats)")
                     if check_count % 5 == 0:
-                        print(f"💓 CLOUDFLARE_LOG: FFmpeg health #{check_count} - Process alive, Runtime {time.time() - start_time:.0f}s", file=sys.stderr, flush=True)
+                        logging.info(f"📊 FFmpeg health status: Process alive (no detailed stats)")
                 except Exception as e:
                     logging.warning(f"💓 FFmpeg health check #{check_count}: Error getting process stats: {e}")
-                    print(f"💓 CLOUDFLARE_WARNING: FFmpeg health check #{check_count} error - {e}", file=sys.stderr, flush=True)
             
             # Process has exited
             exit_code = self.ffmpeg_process.returncode
@@ -991,11 +965,9 @@ class YouTubeLiveStreamer:
                 exit_interpretation = f"Unknown exit code {exit_code}"
             
             # Output comprehensive exit status to stderr
-            print(f"💓 CLOUDFLARE_LOG: FFmpeg health monitor ended - Exit code: {exit_code} ({exit_interpretation}), Runtime: {elapsed_time:.1f}s/{self.duration_seconds}s, Health checks: {check_count}, Duration reached: {duration_reached}", file=sys.stderr, flush=True)
                 
         except Exception as e:
             logging.error(f"💓 FFmpeg health monitor error: {e}")
-            print(f"💓 CLOUDFLARE_ERROR: FFmpeg health monitor exception - {e}", file=sys.stderr, flush=True)
             import traceback
             logging.error(f"💓 Health monitor traceback: {traceback.format_exc()}")
         
@@ -1019,7 +991,6 @@ class YouTubeLiveStreamer:
             except Exception as e:
                 logging.error(f"Error closing ffmpeg console log file: {e}")
         
-        # No need to clean up yt_dlp_process since we're using library mode now
 
 async def send_request(ws, request: TranslateRequestData, log_raw: bool = True):
     """Send request to WebSocket server
@@ -1110,51 +1081,6 @@ async def receive_message(ws) -> TranslateResponseData:
         billing=billing_value
     )
 
-async def send_silence_until_ready(conn, session_id, audio_ready_event, timeout_seconds=8):
-    """Send silence frames until real audio is ready or timeout"""
-    silence_chunk = b'\x00' * 640  # 640 bytes of silence (20ms at 16kHz mono s16le)
-    silence_start_time = time.monotonic()
-    frame_count = 0
-    
-    logging.info(f"🔇 Starting silence bridge (timeout: {timeout_seconds}s)")
-    
-    try:
-        while not audio_ready_event.is_set():
-            # Check timeout
-            elapsed = time.monotonic() - silence_start_time
-            if elapsed >= timeout_seconds:
-                logging.warning(f"🔇 Silence bridge timeout after {elapsed:.2f}s, {frame_count} frames sent")
-                break
-            
-            # Send silence frame
-            chunk_request = TranslateRequestData(
-                session_id=session_id,
-                event="Type_TaskRequest",
-                source_audio=Audio(binary_data=silence_chunk)
-            )
-            
-            await send_request(conn, chunk_request, log_raw=False)
-            frame_count += 1
-            
-            # Log every 50 frames (1 second)
-            if frame_count % 50 == 0:
-                logging.info(f"🔇 Silence bridge: {frame_count} frames sent ({elapsed:.1f}s)")
-            
-            # Wait 20ms for next frame
-            await asyncio.sleep(0.02)
-        
-        # Audio is ready
-        silence_duration = time.monotonic() - silence_start_time
-        if audio_ready_event.is_set():
-            logging.info(f"🔇 Silence bridge completed: {frame_count} frames sent in {silence_duration:.2f}s")
-        return silence_duration, frame_count
-        
-    except Exception as e:
-        silence_duration = time.monotonic() - silence_start_time
-        logging.error(f"🔇 Silence bridge error after {silence_duration:.2f}s: {e}")
-        import traceback
-        logging.error(f"🔇 Silence bridge traceback: {traceback.format_exc()}")
-        return silence_duration, frame_count
 
 async def send_silence_until_ready_with_live_check(conn, session_id, audio_ready_event, live_check_passed_event, timeout_seconds=8):
     """Send silence frames until both audio is ready AND live check passed (两阶段门控)"""
@@ -1395,7 +1321,6 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                 # 首包超时：立即结束（兼容广告/播放列表warmup场景）
                 if chunk_count == 0:
                     logging.error("🔴 Timeout waiting for first PCM chunk - ffmpeg may be stuck or stream unavailable")
-                    print("🔴 CLOUDFLARE_ERROR: Timeout waiting for first PCM chunk - Stream unavailable or FFmpeg stuck", file=sys.stderr, flush=True)
                     break
                 
                 # 后续包：连续超时阈值检测
@@ -1404,16 +1329,13 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                 if consecutive_timeouts >= max_consecutive_timeouts:
                     # 连续超时达到阈值，判定为真实断流
                     logging.error(f"🔴 连续{max_consecutive_timeouts}次超时，判定为直播流中断")
-                    print(f"🔴 CLOUDFLARE_ERROR: 连续{max_consecutive_timeouts}次超时，直播流中断", file=sys.stderr, flush=True)
                     
                     # Check FFmpeg process status on final timeout
                     if ffmpeg_process:
                         if ffmpeg_process.poll() is not None:
                             logging.error(f"⏰ FFmpeg process exited (code: {ffmpeg_process.returncode})")
-                            print(f"⏰ CLOUDFLARE_ERROR: FFmpeg exited with code {ffmpeg_process.returncode}", file=sys.stderr, flush=True)
                         else:
                             logging.error(f"⏰ FFmpeg still running (PID: {ffmpeg_process.pid}) but stream seems ended")
-                            print(f"⏰ CLOUDFLARE_ERROR: FFmpeg running but stream ended (PID: {ffmpeg_process.pid})", file=sys.stderr, flush=True)
                     break
                 else:
                     # 未达阈值，继续重试
@@ -1441,10 +1363,8 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                     ffmpeg_startup_duration = first_pcm_time - ffmpeg_spawn_time
                     logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes, ffmpeg启动耗时: {ffmpeg_startup_duration:.2f}s")
                     # Output critical first chunk timing to stderr for performance monitoring
-                    print(f"🎵 CLOUDFLARE_LOG: First PCM chunk received - Size: {len(chunk)} bytes, FFmpeg startup time: {ffmpeg_startup_duration:.2f}s", file=sys.stderr, flush=True)
                 else:
                     logging.info(f"SUCCESS: First PCM chunk received! {len(chunk)} bytes")
-                    print(f"🎵 CLOUDFLARE_LOG: First PCM chunk received - Size: {len(chunk)} bytes", file=sys.stderr, flush=True)
                 
                 # Signal that audio is ready
                 if audio_ready_event:
@@ -1462,7 +1382,6 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
             
         except Exception as e:
             logging.error(f"❌ Error reading PCM chunk {chunk_count}: {e}")
-            print(f"❌ CLOUDFLARE_ERROR: Error reading PCM chunk {chunk_count} - {e}", file=sys.stderr, flush=True)
             import traceback
             logging.error(f"❌ PCM read traceback: {traceback.format_exc()}")
             
@@ -1471,22 +1390,17 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                 if ffmpeg_process.poll() is not None:
                     logging.error(f"❌ FFmpeg process status on error: exited with code {ffmpeg_process.returncode}")
                     logging.error(f"❌ Check FFmpeg console log file for error details")
-                    print(f"❌ CLOUDFLARE_ERROR: FFmpeg exited on PCM read error - Code: {ffmpeg_process.returncode}", file=sys.stderr, flush=True)
                 else:
                     logging.error(f"❌ FFmpeg process status on error: still running (PID: {ffmpeg_process.pid})")
-                    print(f"❌ CLOUDFLARE_ERROR: FFmpeg still running on PCM read error - PID: {ffmpeg_process.pid}", file=sys.stderr, flush=True)
             break
     
     logging.info(f"📊 PCM chunk reading completed, total chunks: {chunk_count}")
-    print(f"📊 CLOUDFLARE_LOG: PCM chunk reading completed - Total chunks: {chunk_count}", file=sys.stderr, flush=True)
     
     if ffmpeg_process:
         if ffmpeg_process.poll() is not None:
             logging.info(f"📊 Final FFmpeg status: exited with code {ffmpeg_process.returncode}")
-            print(f"📊 CLOUDFLARE_LOG: Final FFmpeg status - Exited with code {ffmpeg_process.returncode}", file=sys.stderr, flush=True)
         else:
             logging.info(f"📊 Final FFmpeg status: still running (PID: {ffmpeg_process.pid})")
-            print(f"📊 CLOUDFLARE_LOG: Final FFmpeg status - Still running (PID: {ffmpeg_process.pid})", file=sys.stderr, flush=True)
 
 async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None, stop_event: Optional[asyncio.Event] = None, finish_grace_timeout: float = 30.0):
     """Generator function that yields translated audio chunks from YouTube live stream"""
@@ -1891,201 +1805,3 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         logging.error(f"Translation streaming traceback: {traceback.format_exc()}")
     finally:
         await streamer.cleanup()
-
-async def translate_youtube_live(conf: Config, youtube_url: str, duration_seconds: int = 10, out_dir: str = "output"):
-    """Main translation function for YouTube live stream (backward compatibility)"""
-    streamer = YouTubeLiveStreamer(youtube_url, duration_seconds)
-    
-    try:
-        # Start streaming pipeline
-        pcm_stream = await streamer.start_streaming_pipeline()
-        
-        # Connect to WebSocket server
-        conn_id = str(uuid.uuid4())
-        headers = await build_http_headers(conf, conn_id)
-        
-        conn = await websockets.connect(
-            conf.ws_url,
-            additional_headers=headers,
-            max_size=1000000000,
-            ping_interval=None
-        )
-        
-        logging.info(f"Connected to server (log id={conn.response.headers.get('X-Tt-Logid')})")
-        log_id = conn.response.headers.get('X-Tt-Logid')
-        
-        session_id = str(uuid.uuid4())
-        
-        # Start session
-        start_request = TranslateRequestData(
-            session_id=session_id,
-            event="Type_StartSession",
-            source_audio=Audio(format="wav", rate=16000, bits=16, channel=1),
-            target_audio=Audio(format="pcm", rate=16000, bits=16, channel=1),
-            mode="s2s",
-            source_language=SOURCE_LANGUAGE,
-            target_language=TARGET_LANGUAGE
-        )
-        
-        await send_request(conn, start_request)
-        resp = await receive_message(conn)
-        if resp.event != Type.SessionStarted:
-            logging.error(f"Unexpected response logid: {log_id}")
-            logging.error(f"Unexpected response: {resp.event}")
-            logging.error(f"Unexpected response message: {resp.message}")
-            await conn.close()
-            return
-        
-        logging.info(f"Session (ID={session_id}) started.")
-        
-        # Send PCM chunks and receive responses
-        recv_audio = bytearray()
-        recv_text = []
-        chunk_count = 0
-        
-        async def send_pcm_chunks():
-            nonlocal chunk_count
-            try:
-                logging.info("Starting to read PCM chunks from ffmpeg...")
-                async for chunk in read_pcm_chunks(pcm_stream, ffmpeg_process=streamer.ffmpeg_process):
-                    if not chunk:
-                        logging.info("No more PCM chunks available")
-                        break
-                    
-                    chunk_count += 1
-                    logging.info(f"Sending PCM chunk {chunk_count}: {len(chunk)} bytes")
-                    
-                    chunk_request = TranslateRequestData(
-                        session_id=session_id,
-                        event="Type_TaskRequest",
-                        source_audio=Audio(binary_data=chunk)
-                    )
-                    await send_request(conn, chunk_request, log_raw=False)
-                    await asyncio.sleep(0.02)  # 20ms delay to match chunk rate
-                
-                logging.info(f"Finished sending {chunk_count} PCM chunks")
-                
-                # Send finish session
-                finish_request = TranslateRequestData(
-                    session_id=session_id,
-                    event="Type_FinishSession",
-                    source_audio=Audio()
-                )
-                await send_request(conn, finish_request)
-                logging.info("FinishSession request sent.")
-                
-            except Exception as e:
-                logging.error(f"Error sending PCM chunks: {e}")
-                import traceback
-                logging.error(traceback.format_exc())
-        
-        # Start sender task
-        sender_task = asyncio.create_task(send_pcm_chunks())
-        
-        # Receive responses
-        try:
-            while True:
-                resp = await receive_message(conn)
-                
-                logging.info(
-                    f"Received message (event={resp.event}, session_id={resp.session_id}): "
-                    f"seq: {resp.sequence}, text: '{resp.text}', audio data length: {len(resp.data)}"
-                )
-                
-                if resp.event == Type.SessionFailed or resp.event == Type.SessionCanceled:
-                    logging.error(f"Session failed, message: {resp.message} logid: {log_id}")
-                    break
-                
-                if resp.event == Type.SessionFinished:
-                    break
-                
-                recv_audio.extend(resp.data)
-                if resp.text:
-                    recv_text.append(resp.text)
-                    
-        except Exception as e:
-            logging.error(f"Receive message error: {e}")
-            import traceback
-            logging.error(f"Receive message traceback: {traceback.format_exc()}")
-        finally:
-            await sender_task
-            await conn.close()
-        
-        # Save results
-        if recv_audio:
-            os.makedirs(out_dir, exist_ok=True)
-            timestamp = time.strftime("%Y%m%dT%H%M%SZ")
-            output_path = Path(out_dir) / f"youtube_translate_{timestamp}.opus"
-            try:
-                with open(output_path, 'wb') as f:
-                    f.write(recv_audio)
-                logging.info(f"Session finished, audio saved as: {output_path}")
-                logging.info(f"Session finished, text: {' '.join(recv_text)}")
-                logging.info(f"Total PCM chunks sent: {chunk_count}")
-            except Exception as e:
-                logging.error(f"Save audio file: {e}")
-        else:
-            logging.error("Session finished, no audio data received.")
-            
-    except Exception as e:
-        logging.error(f"Translation error: {e}")
-        import traceback
-        logging.error(f"Translation traceback: {traceback.format_exc()}")
-    finally:
-        await streamer.cleanup()
-
-async def main():
-    """Main function"""
-    if not all([APP_KEY, ACCESS_KEY, RESOURCE_ID, WS_URL]):
-        logging.error("Missing required environment variables. Please check your .env file.")
-        return
-    
-    # 预热yt-dlp管理器
-    logging.info("🚀 Initializing application...")
-    init_start_time = time.time()
-    
-    try:
-        await ytdlp_manager.warmup()
-        init_elapsed_time = time.time() - init_start_time
-        logging.info(f"🚀 Application initialization completed in {init_elapsed_time:.2f}s")
-    except Exception as e:
-        logging.warning(f"🚀 Application initialization failed (continuing anyway): {e}")
-    
-    conf = Config(
-        ws_url=WS_URL,
-        app_key=APP_KEY,
-        access_key=ACCESS_KEY,
-        resource_id=RESOURCE_ID
-    )
-    
-    youtube_url = "https://www.youtube.com/watch?v=HHGEDLPBIxA"
-    duration_seconds = 100  # Test with 100 seconds
-    
-    logging.info(f"Starting YouTube live translation for {duration_seconds} seconds")
-    logging.info(f"YouTube URL: {youtube_url}")
-    
-    start_time = time.time()
-    try:
-        await translate_youtube_live(conf, youtube_url, duration_seconds)
-    finally:
-        # 清理资源
-        ytdlp_manager.cleanup()
-        
-    end_time = time.time()
-    
-    logging.info(f"Total processing time: {end_time - start_time:.2f} seconds")
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Process interrupted by user")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-        import traceback
-        logging.error(f"Unexpected error traceback: {traceback.format_exc()}")
