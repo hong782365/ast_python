@@ -80,16 +80,15 @@
       - 通过 `YtDlpManager.extract_stream_url()` 提取直播音频直链（线程池执行，支持 warmup）。
       - 根据环境（Cloudflare/本地）选择日志策略。
       - 组装 FFmpeg 命令，启用低延迟参数（`-fflags nobuffer` 等），从直链抓流输出 16kHz mono PCM；记录 `ffmpeg_process`、`pcm_stream` 及 spawn 时间；启动日志/健康监控。
-  - `live_check_task = ytdlp_manager.check_live_status()`：
     - 使用 yt-dlp 轻量查询直播状态，返回 `is_live`、`live_status`、`title` 等。
 - **Phase 3：等待翻译 WebSocket 准备就绪**
   - 先等待 Phase 1 完成，以便尽快发送静音桥数据。
-  - 创建两个同步原语：`audio_ready_event`（首帧 PCM 就绪）、`live_check_passed_event`（直播检查通过）。
+  - 创建同步原语：`audio_ready_event`（首帧 PCM 就绪）。
   - 创建 `stream_queue`（给调用方的数据缓冲）与 `finished` 事件。
 
-### 6.2 静音桥与两阶段门控
-- Phase 4 中立即启动 `send_silence_until_ready_with_live_check()`（`ast_youtube_demo.py:1159`）：
-  - 每 20ms 向翻译服务发送 640 字节静音帧 (`Type_TaskRequest`)，直到 **首帧 PCM 就绪** 且 **直播检查通过** 或达到超时。
+### 6.2 静音桥
+- Phase 4 中立即启动 `send_silence_until_ready()`：
+  - 每 20ms 向翻译服务发送 640 字节静音帧 (`Type_TaskRequest`)，直到 **首帧 PCM 就绪** 或达到超时。
   - 期间持续记录帧数与耗时；若超时会记录最终状态。
 - `read_pcm_chunks()`（`ast_youtube_demo.py:1357`）负责读取 FFmpeg 输出：
   - 对首帧设置 30s 超时，其余帧 10s 超时，连续超时 3 次判定断流。
@@ -100,7 +99,7 @@
   - 首先确认 FFmpeg 仍存活，否则直接结束。
   - 迭代 `read_pcm_chunks()` 输出：
     - 若外部 `stop_event` 被置位，则记录后跳出循环，准备结束流程。
-    - 在两阶段门控未全部满足前丢弃真实音频，以保持管道畅通。
+    - 在 PCM 未就绪前丢弃真实音频，以保持管道畅通。
     - 条件满足后，将 PCM chunk 封装为 `TranslateRequestData(event="Type_TaskRequest")`，通过 `send_request()` 序列化为 protobuf 并发送。
     - 借助 `ASTEventLogger`（`ast_youtube_demo.py:198`）记录关键事件，控制日志频率。
   - 循环结束后（自然停止或 stop 信号）发送一次 `Type_FinishSession` 请求，确保翻译服务进入收尾阶段。
@@ -117,17 +116,9 @@
     - 对 `UsageResponse`/`SessionFinished` 额外生成 `system_event` JSON，带出计费信息。
   - 所有响应事件均交给 `ASTEventLogger` 记录。
 
-### 6.5 直播校验与数据产出
+### 6.5 数据产出
 - Phase 5 等待 FFmpeg 打开后立即启动发送/接收任务（Phase 6）。
-- Phase 7 等待 `live_check_task` 完成，执行 `is_live_valid()`：
-  - 允许状态：`is_live=True` 或 `live_status == "is_live"`。
-  - 其他状态映射为错误码（如 `LIVE_NOT_STARTED`、`LIVE_ENDED` 等）。
-- 若校验失败：
-  - 取消静音桥、发送、接收任务，调用 `build_error_json()` 组装错误描述。
-  - 再次发送 `FinishSession`，关闭翻译 WebSocket。
-  - `yield StreamData(data_type="error", content=<error_json>)`，终止生成器。
-- 校验通过：
-  - 设置 `live_check_passed_event`，允许真实音频发送。
+- PCM 管道准备就绪后开始音频发送：
   - 主循环持续 `await stream_queue.get()`：
     - 若拿到 1s 内的音频/字幕数据即 `yield` 给调用方。
     - 1s 超时则继续等待，直到 `finished` 被置位。
@@ -140,7 +131,7 @@
 - `StreamData`（`ast_youtube_demo.StreamData`）类型：
   - `data_type="audio"`：二进制 PCM，供 `WebSocketPublishClient.send_audio_frame()` 直接转发。
   - `data_type="subtitle"`：JSON 字符串，包含源/译字幕、系统消息等。
-  - `data_type="error"`：直播校验失败时的 JSON 描述。
+  - `data_type="error"`：系统异常时的 JSON 描述。
 
 ## 7. 停止流程与清理
 - HTTP `/python/ingest/stop` 调用 `stop_publishing_session()`：
@@ -182,7 +173,7 @@
    - 调用 `translate_youtube_live_stream` 获取 `StreamData` 序列。
 5. `translate_youtube_live_stream` 内部：
    - 并行建立翻译服务会话、启动 FFmpeg 拉流、检查直播状态。
-   - 静音桥保持翻译会话存活，首包到达后与直播校验一起决定是否发送真实音频。
+   - 静音桥保持翻译会话存活，首包到达后开始发送真实音频。
    - 不断读取翻译响应，依次 `yield` 音频/字幕/系统事件。
 6. `_stream_translated_audio` 消费 `StreamData`：
    - 音频通过 `WebSocketPublishClient.send_audio_frame()` 转发到外部。
@@ -193,4 +184,4 @@
 
 ---
 
-以上为 `publisher.py` 及其依赖的主要逻辑流转，涵盖请求入口、后台流水线、对外 WebSocket 发送、直播校验、停止与清理的全过程。若需要检查具体实现，可对照文中标注的函数与文件位置进行代码级验证。
+以上为 `publisher.py` 及其依赖的主要逻辑流转，涵盖请求入口、后台流水线、对外 WebSocket 发送、停止与清理的全过程。若需要检查具体实现，可对照文中标注的函数与文件位置进行代码级验证。
