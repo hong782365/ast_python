@@ -120,6 +120,7 @@ docker run -p 9000:9000 --env-file .env ast-publisher
 - `python_protogen/` - 生成的protobuf Python代码
 - `youtube/cookie/` - YouTube认证cookies
 - `doc/publisher_flow.md` - 详细的流程文档
+- `doc/同声传译2.0-API接入文档.md` - 同声传译API文档
 
 ## 开发注意事项
 - 重构后保持所有API接口向后兼容
