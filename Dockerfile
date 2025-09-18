@@ -23,4 +23,4 @@ COPY . .
 EXPOSE 9000
 
 # 启动命令
-CMD ["python", "publisher.py"]
+CMD ["python", "main.py"]
