@@ -24,7 +24,7 @@
 ## 3. 会话管理与状态机 (`AudioStreamPublisher`)
 - `PublisherSession` 数据类（`publisher.py:102`）记录会话元数据：
   - `session_id`、`youtube_url`、`publish_url`、`status`、`created_at`。
-  - 运行态引用：`websocket`（未使用保留项）、`streamer`（`YouTubeLiveStreamer`）、`task`（后台协程）、`stop_event`、`publisher_ws`（对下游 WebSocket 客户端的持有）。
+  - 运行态引用：`task`（后台协程）、`stop_event`、`publisher_ws`（对下游 WebSocket 客户端的持有）。
 - `start_publishing_session()` 核心逻辑：
   1. 维护活跃状态列表：`initializing`、`starting`、`connected_to_publisher`、`processing_audio`，用于判定并发限制。
   2. 如果 `session_id` 已存在：
@@ -124,7 +124,7 @@
   - 其他状态映射为错误码（如 `LIVE_NOT_STARTED`、`LIVE_ENDED` 等）。
 - 若校验失败：
   - 取消静音桥、发送、接收任务，调用 `build_error_json()` 组装错误描述。
-  - 再次发送 `FinishSession`，关闭翻译 WebSocket，调用 `streamer.cleanup()`。
+  - 再次发送 `FinishSession`，关闭翻译 WebSocket。
   - `yield StreamData(data_type="error", content=<error_json>)`，终止生成器。
 - 校验通过：
   - 设置 `live_check_passed_event`，允许真实音频发送。
@@ -134,7 +134,7 @@
   - `finally` 中用 `asyncio.shield` 确保：
     - 等待静音桥、发送、接收任务退出，捕获异常。
     - 调用 `conn.close()` 关闭翻译 WebSocket。
-- 整个 `try`/`finally` 结束后调用 `streamer.cleanup()` 停止 FFmpeg、释放日志句柄。
+- 整个 `try`/`finally` 结束后进行资源清理。
 
 ### 6.6 生成给上游的 `StreamData`
 - `StreamData`（`ast_youtube_demo.StreamData`）类型：
@@ -151,13 +151,13 @@
   - `await session.task` 等待后台任务自然结束；超时则取消任务并标记 `stopped`。
   - 无论成功与否都会执行 `_background_cleanup()`。
 - `_background_cleanup()`：分阶段清理资源：
-  1. 立即触发关键断连：调用 `publisher_ws.disconnect()`、`streamer.cleanup()`（通过 `asyncio.create_task` 并行执行）。
+  1. 立即触发关键断连：调用 `publisher_ws.disconnect()`（通过 `asyncio.create_task` 并行执行）。
   2. 最多等待 3s 让主任务退出；随后等待最多 5s 等所有清理任务完成。
   3. 调用 `_cleanup_session()` 做兜底清理，然后把会话从 `sessions` 字典移除。
   4. 如果任一阶段出错，仍会尝试 `_cleanup_session()` 并最终移除字典条目。
 - `_cleanup_session()` 负责：
   - 取消仍在运行的任务（1s 超时）。
-  - 关闭 `session.websocket`（若存在）、断开 `publisher_ws`、释放 `streamer`。
+  - 断开 `publisher_ws`。
   - 不移除字典条目，交由 `_background_cleanup()` 统一处理，避免竞态。
 
 ## 8. HTTP 响应与其他接口

@@ -21,7 +21,7 @@ load_dotenv()
 logging.info("🚀 Publisher script starting...")
 
 try:
-    from ast_youtube_demo import Config, YouTubeLiveStreamer, translate_youtube_live_stream, ytdlp_manager
+    from ast_youtube_demo import Config, translate_youtube_live_stream, ytdlp_manager
 except Exception as e:
     logging.error(f"❌ YouTube demo imports failed: {e}")
     sys.exit(1)
