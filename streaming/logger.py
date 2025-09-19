@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 from typing import Optional
 
-from core.config import AST_EVENT_DIR, SOURCE_LANGUAGE, TARGET_LANGUAGE
+from core.config import SOURCE_LANGUAGE, TARGET_LANGUAGE
 from .models import TranslateRequestData, TranslateResponseData, BillingItemData
 
 # Import protobuf types after ensuring path is set
@@ -109,15 +109,8 @@ class ASTEventLogger:
         self.youtube_url = youtube_url
         self.youtube_id = self._extract_youtube_id(youtube_url)
         
-        # 创建日志文件
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = f"ast_{timestamp}_{self.youtube_id}.txt"
-        
-        # 确保目录存在
-        self.log_dir = AST_EVENT_DIR
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        
-        self.log_file = self.log_dir / filename
+        # 使用结构化日志记录器
+        self.logger = logging.getLogger("ast.event")
         
         # 事件类型映射
         self.event_descriptions = {
@@ -141,7 +134,7 @@ class ASTEventLogger:
             Type.AudioMuted: "静音事件-AudioMuted-250"
         }
         
-        logging.info(f"AST事件日志文件创建: {self.log_file}")
+        logging.info(f"AST事件日志记录器初始化完成，YouTube ID: {self.youtube_id}")
     
     def _extract_youtube_id(self, url: str) -> str:
         """从YouTube URL中提取视频ID"""
@@ -166,7 +159,6 @@ class ASTEventLogger:
         if event_type not in self.event_descriptions:
             return
             
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S,") + str(int(time.time() * 1000) % 1000).zfill(3)
         description = self.event_descriptions[event_type]
         
         # 构建JSON数据
@@ -203,10 +195,14 @@ class ASTEventLogger:
                     "data": "二进制数据"
                 }
         
-        # 写入日志文件
-        log_entry = f"{timestamp} ==>> {description}: {json.dumps(json_data, ensure_ascii=False)}\n"
-        with open(self.log_file, 'a', encoding='utf-8') as f:
-            f.write(log_entry)
+        # 输出结构化JSON日志
+        event_log = {
+            "type": "event",
+            "direction": "send", 
+            "description": description,
+            "data": json_data
+        }
+        self.logger.info(json.dumps(event_log, ensure_ascii=False))
     
     def log_receive_event(self, response_data: TranslateResponseData):
         """记录接收端事件"""
@@ -214,7 +210,6 @@ class ASTEventLogger:
         if event_type not in self.event_descriptions:
             return
             
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S,") + str(int(time.time() * 1000) % 1000).zfill(3)
         description = self.event_descriptions[event_type]
         
         # 构建JSON数据
@@ -271,28 +266,18 @@ class ASTEventLogger:
                 if billing_data:
                     json_data["billing"] = billing_data
         
-        # 写入日志文件
-        log_entry = f"{timestamp} ==>> {description}: {json.dumps(json_data, ensure_ascii=False)}\n"
-        with open(self.log_file, 'a', encoding='utf-8') as f:
-            f.write(log_entry)
+        # 输出结构化JSON日志
+        event_log = {
+            "type": "event",
+            "direction": "receive",
+            "description": description,
+            "data": json_data
+        }
+        self.logger.info(json.dumps(event_log, ensure_ascii=False))
 
 class YtdlpLogger:
-    def __init__(self, name="ytdlp", logfile="youtube/logs/yt-dlp-debug.log"):
-        import logging, os
-        from core.config import BASE_DIR
-        
+    def __init__(self, name="ast.ytdlp"):
         self._log = logging.getLogger(name)
-        if not self._log.handlers:
-            # 确保日志目录存在
-            log_path = BASE_DIR / logfile
-            log_dir = log_path.parent
-            log_dir.mkdir(parents=True, exist_ok=True)
-                
-            fh = logging.FileHandler(log_path, encoding="utf-8")
-            fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-            fh.setFormatter(fmt)
-            self._log.addHandler(fh)
-            self._log.setLevel(logging.DEBUG)
         self._ts = time.time()
 
     def _stamp(self, level, msg):

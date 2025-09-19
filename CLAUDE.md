@@ -109,10 +109,13 @@ docker run -p 9000:9000 --env-file .env ast-publisher
 - 验证会话管理和资源清理的正确性
 
 ## 故障排查
-- **FFmpeg日志**: `youtube/ffmpeg/log/` 目录
-- **翻译事件日志**: `youtube/ast_event/` 目录  
-- **yt-dlp调试日志**: `youtube/logs/yt-dlp-debug.log`
-- **应用日志**: 控制台输出或容器日志
+- **所有日志**: 统一输出到控制台/容器日志
+- **日志组件分类**:
+  - `ast.ffmpeg`: FFmpeg 相关日志
+  - `ast.ytdlp`: yt-dlp 相关日志
+  - `ast.event`: 翻译事件结构化日志（JSON格式）
+  - `ast.session`: 会话管理日志
+- **FFmpeg stderr**: 直接输出错误和进度信息
 
 ## 重要文件
 - `ffmpeg_utils.py` - FFmpeg工具函数

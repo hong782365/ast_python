@@ -146,10 +146,14 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 - 不在日志中暴露敏感信息
 - cookie 文件路径安全性
 
-### 故障排查路径
-- FFmpeg 日志: `youtube/ffmpeg/log/`
-- 翻译事件日志: `youtube/ast_event/`
-- yt-dlp 调试: `youtube/logs/yt-dlp-debug.log`
+### 故障排查策略
+- **统一控制台日志**: 所有组件输出到 stdout/stderr
+- **结构化日志格式**: JSON 格式便于解析和过滤
+- **日志组件标识**: 
+  - `ast.ffmpeg`: FFmpeg 处理日志
+  - `ast.ytdlp`: YouTube 流提取日志
+  - `ast.event`: 翻译事件JSON日志
+  - `ast.session`: 会话管理日志
 
 ## 相关文档
 - 详细架构流程: `doc/publisher_flow.md`

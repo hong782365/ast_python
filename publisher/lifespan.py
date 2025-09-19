@@ -16,9 +16,9 @@ async def lifespan(app):
         validate_config()
         logging.info("✅ Configuration validation passed")
         
-        # 确保目录存在
+        # 目录创建已改为no-op（日志输出到控制台）
         ensure_directories()
-        logging.info("✅ Required directories created")
+        logging.info("✅ 日志输出模式：控制台")
         
         # 初始化yt-dlp管理器
         init_start_time = time.time()

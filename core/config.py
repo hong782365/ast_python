@@ -10,10 +10,6 @@ load_dotenv()
 # Define project paths
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROTO_DIR = BASE_DIR / "python_protogen"
-LOG_DIR = BASE_DIR / "youtube" / "logs"
-FFMPEG_REPORT_DIR = BASE_DIR / "youtube" / "ffmpeg" / "report"
-FFMPEG_LOG_DIR = BASE_DIR / "youtube" / "ffmpeg" / "log"
-AST_EVENT_DIR = BASE_DIR / "youtube" / "ast_event"
 
 # Add protobuf path to sys.path if not already present
 if str(PROTO_DIR) not in sys.path:
@@ -47,7 +43,5 @@ def validate_config():
         raise RuntimeError(f"Missing required environment variables: {missing}")
 
 def ensure_directories():
-    """Ensure all required directories exist."""
-    directories = [LOG_DIR, FFMPEG_REPORT_DIR, FFMPEG_LOG_DIR, AST_EVENT_DIR]
-    for directory in directories:
-        directory.mkdir(parents=True, exist_ok=True)
+    """No-op function - all logging now goes to stdout/stderr."""
+    pass
