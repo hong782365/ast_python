@@ -91,15 +91,13 @@ class YouTubeLiveStreamer:
             ffmpeg_start_time = time.time()
             ffmpeg_env = os.environ.copy()
             
-            # 统一使用 stderr 直接输出到控制台
+            # 统一使用 stderr 直接输出到控制台，保持 PCM 二进制数据
             self.ffmpeg_process = subprocess.Popen(
                 ffmpeg_cmd,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.PIPE,  # PCM 二进制数据输出
                 stderr=sys.stderr,  # FFmpeg stderr 直接输出到控制台
                 bufsize=0,
-                env=ffmpeg_env,
-                encoding='utf-8',
-                text=True
+                env=ffmpeg_env
             )
             
             # No need for yt-dlp process anymore

@@ -7,10 +7,10 @@
   - 导入 `core.config`，调用 `setup_logging()` 配置日志后再加载 FastAPI 应用。
   - 直接运行脚本时使用 `uvicorn.run(app, host="0.0.0.0", port=9000)` 启动服务。
 - 配置模块 `core/config.py`
-  - 在导入阶段读取 `.env`，计算项目基准路径 (`BASE_DIR`)、protobuf 目录 (`PROTO_DIR`)、日志目录等，并确保 `PROTO_DIR` 已加入 `sys.path`。
+  - 在导入阶段读取 `.env`，计算项目基准路径 (`BASE_DIR`)、protobuf 目录 (`PROTO_DIR`)，并确保 `PROTO_DIR` 已加入 `sys.path`。
   - 暴露 `APP_KEY`、`ACCESS_KEY` 等配置常量，以及 `setup_logging()`、`validate_config()`、`ensure_directories()` 等工具函数。
 - 生命周期管理 `publisher/lifespan.py`
-  - 在 FastAPI `startup`：验证环境变量、创建日志/FFmpeg/事件目录，获取 `streaming.get_manager()` 并执行 `warmup()`。
+  - 在 FastAPI `startup`：验证环境变量、设置控制台日志模式，获取 `streaming.get_manager()` 并执行 `warmup()`。
   - 在 `shutdown`：再次获取 `ytdlp_manager` 执行 `cleanup()`。
 
 ## 2. FastAPI 应用与路由
@@ -50,7 +50,7 @@
 - `streaming/models.py`
   - 定义翻译域的基础数据结构：`Config`、`Audio`、`TranslateRequestData`、`TranslateResponseData`、`StreamData` 等。
 - `streaming/logger.py`
-  - `safe_serialize_protobuf()`、`log_protobuf_message()` 打印原始 protobuf；`ASTEventLogger` 记录会话事件到 `core.config.AST_EVENT_DIR`。
+  - `safe_serialize_protobuf()`、`log_protobuf_message()` 打印原始 protobuf；`ASTEventLogger` 通过结构化日志记录器 `ast.event` 输出JSON格式事件到控制台。
 - `streaming/proto_helpers.py`
   - `connect_websocket_and_start_session()` 建立与翻译服务的 WebSocket 连接并发送 `StartSession`。
   - `send_request()`、`receive_message()` 负责 protobuf 序列化/反序列化。
@@ -93,6 +93,22 @@
             └─返回 201/202/409
 ```
 - `/python/ingest/stop` 触发 `stop_event` 并进入宽限期；`/python/sessions` 用于观察当前会话列表；`/python/health` 简单返回服务状态。
+
+## 9. 日志输出架构（2025重构后）
+
+### 统一控制台输出模式
+- **所有组件日志**：统一输出到 stdout/stderr，符合容器化最佳实践
+- **FFmpeg stderr**：错误和进度信息直接输出到控制台
+- **无文件日志**：不再创建本地日志文件，简化部署和运维
+
+### 结构化日志组件
+- `ast.ffmpeg`: FFmpeg 相关日志
+- `ast.ytdlp`: yt-dlp 相关日志
+- `ast.event`: 翻译事件 JSON 日志
+- `ast.session`: 会话管理日志
+
+### 故障排查
+运维人员可通过容器日志或 `docker logs` 命令查看所有组件的实时日志输出，支持现代日志聚合工具（ELK、Prometheus等）进行集中监控。
 
 ---
 
