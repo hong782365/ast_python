@@ -5,7 +5,7 @@ import os
 import time
 from typing import Optional
 
-from core.config import SOURCE_LANGUAGE, TARGET_LANGUAGE
+from core.config import SOURCE_LANGUAGE, TARGET_LANGUAGE, AUDIO_CHUNK_SLEEP_SECONDS, AUDIO_LOG_INTERVAL
 from .models import Config, StreamData, SubtitleMessage, TranslateRequestData, TranslateResponseData, Audio
 from .logger import ASTEventLogger
 from .streamer import YouTubeLiveStreamer
@@ -169,7 +169,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     
                     if not audio_ready:
                         # 条件未满足，丢弃这个PCM帧但保持管道畅通
-                        if chunk_count % 50 == 0:
+                        if chunk_count % AUDIO_LOG_INTERVAL == 0:
                             logging.info(f"🚫 Discarding PCM chunk {chunk_count} (waiting for audio_ready={audio_ready})")
                         continue  # 继续读取下一个chunk但不发送
                     
@@ -177,8 +177,8 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     if chunk_count == 1:
                         logging.info(f"🎵 First PCM chunk transmission started (chunk #{chunk_count})")
                     
-                    # Log every 50 chunks (about 1 second of audio)
-                    if chunk_count % 50 == 0:
+                    # Log every AUDIO_LOG_INTERVAL chunks (about 1 second of audio)
+                    if chunk_count % AUDIO_LOG_INTERVAL == 0:
                         logging.info(f"Sent {chunk_count} PCM chunks, {total_bytes} total bytes")
                     else:
                         logging.debug(f"Sending PCM chunk {chunk_count}: {len(chunk)} bytes")
@@ -190,11 +190,11 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     )
                     
                     # 记录TaskRequest事件（只记录第一个和每50个chunk以避免日志过多）
-                    if chunk_count == 1 or chunk_count % 50 == 0:
+                    if chunk_count == 1 or chunk_count % AUDIO_LOG_INTERVAL == 0:
                         event_logger.log_send_event(Type.TaskRequest, chunk_request)
                     
                     await send_request(conn, chunk_request, log_raw=False)
-                    await asyncio.sleep(0.02)  # 20ms delay to match chunk rate
+                    await asyncio.sleep(AUDIO_CHUNK_SLEEP_SECONDS)  # Configurable delay to match chunk rate
                 
                 logging.info(f"Finished sending {chunk_count} PCM chunks, total {total_bytes} bytes")
                 

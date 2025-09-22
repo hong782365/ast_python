@@ -25,6 +25,17 @@ WS_URL = os.getenv("WS_URL")
 SOURCE_LANGUAGE = "en"
 TARGET_LANGUAGE = "zh"
 
+# Audio streaming configuration
+AUDIO_CHUNK_DURATION_MS = 80  # 关键参数：改成80解决AudioSendSlow问题
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_BITS = 16
+AUDIO_CHANNELS = 1
+
+# Calculated derived values
+AUDIO_CHUNK_SIZE = (AUDIO_CHUNK_DURATION_MS * AUDIO_SAMPLE_RATE * AUDIO_BITS * AUDIO_CHANNELS) // (8 * 1000)
+AUDIO_CHUNK_SLEEP_SECONDS = AUDIO_CHUNK_DURATION_MS / 1000.0
+AUDIO_LOG_INTERVAL = max(1, 1000 // AUDIO_CHUNK_DURATION_MS)  # 确保至少1秒日志一次
+
 # Required environment variables for validation
 REQUIRED_VARS = ["APP_KEY", "ACCESS_KEY", "RESOURCE_ID", "WS_URL"]
 

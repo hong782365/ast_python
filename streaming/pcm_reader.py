@@ -2,11 +2,14 @@ import asyncio
 import logging
 import time
 
-async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None, audio_ready_event=None, ffmpeg_spawn_time=None):
-    """Read PCM data in chunks (640 bytes = 20ms at 16kHz mono s16le)"""
+from core.config import AUDIO_CHUNK_SIZE, AUDIO_LOG_INTERVAL
+
+async def read_pcm_chunks(pcm_stream, chunk_size: int = None, ffmpeg_process=None, audio_ready_event=None, ffmpeg_spawn_time=None):
+    """Read PCM data in chunks (configurable size for optimal API performance)"""
     import asyncio
     loop = asyncio.get_event_loop()
     chunk_count = 0
+    chunk_size = chunk_size or AUDIO_CHUNK_SIZE
     first_chunk_received = False
     consecutive_timeouts = 0  # 连续超时计数
     max_consecutive_timeouts = 3  # 连续超时阈值
@@ -92,7 +95,7 @@ async def read_pcm_chunks(pcm_stream, chunk_size: int = 640, ffmpeg_process=None
                 if audio_ready_event:
                     audio_ready_event.set()
                     logging.info(f"🎵 Audio ready event signaled")
-            elif chunk_count % 50 == 0:
+            elif chunk_count % AUDIO_LOG_INTERVAL == 0:
                 logging.info(f"Successfully read PCM chunk {chunk_count}: {len(chunk)} bytes")
                 # Periodic FFmpeg health check
                 if ffmpeg_process and ffmpeg_process.poll() is not None:

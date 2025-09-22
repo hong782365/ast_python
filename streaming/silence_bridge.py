@@ -2,12 +2,13 @@ import asyncio
 import logging
 import time
 
+from core.config import AUDIO_CHUNK_SIZE, AUDIO_CHUNK_SLEEP_SECONDS, AUDIO_LOG_INTERVAL
 from .models import TranslateRequestData, Audio
 from .proto_helpers import send_request
 
 async def send_silence_until_ready(conn, session_id, audio_ready_event, timeout_seconds=8):
     """Send silence frames until audio is ready"""
-    silence_chunk = b'\x00' * 640  # 640 bytes of silence (20ms at 16kHz mono s16le)
+    silence_chunk = b'\x00' * AUDIO_CHUNK_SIZE  # Configurable silence chunk size
     silence_start_time = time.monotonic()
     frame_count = 0
     
@@ -31,12 +32,12 @@ async def send_silence_until_ready(conn, session_id, audio_ready_event, timeout_
             await send_request(conn, chunk_request, log_raw=False)
             frame_count += 1
             
-            # Log every 50 frames (1 second)
-            if frame_count % 50 == 0:
+            # Log every AUDIO_LOG_INTERVAL frames (~1 second)
+            if frame_count % AUDIO_LOG_INTERVAL == 0:
                 logging.info(f"🔇 Silence bridge: {frame_count} frames sent ({elapsed:.1f}s)")
             
-            # Wait 20ms for next frame
-            await asyncio.sleep(0.02)
+            # Wait for next frame interval
+            await asyncio.sleep(AUDIO_CHUNK_SLEEP_SECONDS)
         
         # Audio is ready
         silence_duration = time.monotonic() - silence_start_time
