@@ -189,7 +189,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                         source_audio=Audio(binary_data=chunk)
                     )
                     
-                    # 记录TaskRequest事件（只记录第一个和每50个chunk以避免日志过多）
+                    # 记录TaskRequest事件（只记录第一个和每AUDIO_LOG_INTERVAL个chunk以避免日志过多）
                     if chunk_count == 1 or chunk_count % AUDIO_LOG_INTERVAL == 0:
                         event_logger.log_send_event(Type.TaskRequest, chunk_request)
                     

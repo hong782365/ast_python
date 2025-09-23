@@ -138,7 +138,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 
 ### 性能考虑
 - yt-dlp 预热机制减少首次延迟
-- PCM 数据流 20ms 帧率同步
+- PCM 数据流 80ms 帧率同步
 - 宽限期机制确保优雅停止
 
 ### 安全要求
