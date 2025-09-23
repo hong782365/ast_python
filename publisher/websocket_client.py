@@ -1,11 +1,12 @@
 import asyncio
+import json
 import logging
 import time
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 class WebSocketPublishClient:
-    def __init__(self, publish_url: str, session_id: str):
+    def __init__(self, publish_url: str, session_id: str, control_message_callback=None):
         self.publish_url = publish_url
         self.session_id = session_id
         self.websocket = None
@@ -18,6 +19,9 @@ class WebSocketPublishClient:
         self.heartbeat_task = None
         self.frame_count = 0
         self.start_time = None
+        self.control_message_callback = control_message_callback
+        self.message_listener_task = None
+        self.is_listening = False
         
     async def connect(self):
         """Connect to WebSocket with exponential backoff retry"""
@@ -38,6 +42,10 @@ class WebSocketPublishClient:
                 
                 # Start heartbeat
                 self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+                
+                # Start message listener if callback is provided
+                if self.control_message_callback:
+                    await self.start_message_listener()
                 
                 return
                 
@@ -116,8 +124,70 @@ class WebSocketPublishClient:
             # Retry sending the message
             await self.websocket.send(text_message)
     
+    async def start_message_listener(self):
+        """启动消息监听循环"""
+        if self.is_listening:
+            return
+        
+        self.is_listening = True
+        self.message_listener_task = asyncio.create_task(self._message_listener_loop())
+        self.logger.info(f"Session {self.session_id}: Started message listener")
+    
+    async def _message_listener_loop(self):
+        """监听WebSocket消息的循环"""
+        try:
+            while self.is_listening and self.websocket:
+                try:
+                    # 设置合理的接收超时，避免无限阻塞
+                    message = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
+                    await self._handle_received_message(message)
+                except asyncio.TimeoutError:
+                    # 超时是正常的，继续循环
+                    continue
+                except ConnectionClosed:
+                    self.logger.info(f"Session {self.session_id}: WebSocket connection closed during message listening")
+                    break
+                except Exception as e:
+                    self.logger.error(f"Session {self.session_id}: Message listener error: {e}")
+                    if self.websocket and self.websocket.closed:
+                        break
+                    # 其他错误继续监听
+                    await asyncio.sleep(1.0)
+        except Exception as e:
+            self.logger.error(f"Session {self.session_id}: Message listener loop error: {e}")
+        finally:
+            self.is_listening = False
+            self.logger.info(f"Session {self.session_id}: Message listener stopped")
+    
+    async def _handle_received_message(self, message):
+        """处理接收到的消息"""
+        try:
+            # 尝试解析JSON控制消息
+            data = json.loads(message)
+            if data.get("type") == "system_control":
+                self.logger.info(f"Session {self.session_id}: Received control message: {data}")
+                if self.control_message_callback:
+                    await self.control_message_callback(data)
+            else:
+                self.logger.debug(f"Session {self.session_id}: Received non-control message: {data}")
+        except json.JSONDecodeError:
+            # 非JSON消息，可能是其他类型数据，记录但忽略
+            self.logger.debug(f"Session {self.session_id}: Received non-JSON message: {len(message)} bytes")
+        except Exception as e:
+            self.logger.error(f"Session {self.session_id}: Error handling received message: {e}")
+    
     async def disconnect(self):
         """Gracefully disconnect"""
+        # Stop message listening
+        self.is_listening = False
+        if self.message_listener_task:
+            self.message_listener_task.cancel()
+            try:
+                await self.message_listener_task
+            except asyncio.CancelledError:
+                pass
+        
+        # Stop heartbeat
         if self.heartbeat_task:
             self.heartbeat_task.cancel()
             try:
@@ -125,6 +195,7 @@ class WebSocketPublishClient:
             except asyncio.CancelledError:
                 pass
         
+        # Close WebSocket
         if self.websocket:
             await self.websocket.close()
             self.logger.info(f"Session {self.session_id}: Disconnected from publisher")

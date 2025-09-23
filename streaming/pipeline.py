@@ -164,22 +164,26 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     chunk_count += 1
                     total_bytes += len(chunk)
                     
-                    # 检查是否允许发送真实PCM
+                    # 🔥关键修改：双重条件检查
                     audio_ready = audio_ready_event.is_set()
+                    translation_allowed = translation_allowed_event.is_set() if translation_allowed_event else True
                     
-                    if not audio_ready:
+                    if not (audio_ready and translation_allowed):
                         # 条件未满足，丢弃这个PCM帧但保持管道畅通
                         if chunk_count % AUDIO_LOG_INTERVAL == 0:
-                            logging.info(f"🚫 Discarding PCM chunk {chunk_count} (waiting for audio_ready={audio_ready})")
+                            logging.info(
+                                f"🚫 Discarding PCM chunk {chunk_count} "
+                                f"(audio_ready={audio_ready}, translation_allowed={translation_allowed})"
+                            )
                         continue  # 继续读取下一个chunk但不发送
                     
-                    # 条件满足，发送真实PCM
+                    # 双重条件都满足，发送真实PCM
                     if chunk_count == 1:
-                        logging.info(f"🎵 First PCM chunk transmission started (chunk #{chunk_count})")
+                        logging.info(f"🎵 First PCM chunk transmission started (both conditions met, chunk #{chunk_count})")
                     
                     # Log every AUDIO_LOG_INTERVAL chunks (about 1 second of audio)
                     if chunk_count % AUDIO_LOG_INTERVAL == 0:
-                        logging.info(f"Sent {chunk_count} PCM chunks, {total_bytes} total bytes")
+                        logging.info(f"Sent {chunk_count} PCM chunks, {total_bytes} total bytes (conditions: audio_ready={audio_ready}, translation_allowed={translation_allowed})")
                     else:
                         logging.debug(f"Sending PCM chunk {chunk_count}: {len(chunk)} bytes")
                     

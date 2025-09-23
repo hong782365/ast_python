@@ -252,17 +252,45 @@ class AudioStreamPublisher:
                 resource_id=RESOURCE_ID
             )
             
-            # Start WebSocket connection to publish URL first
-            ws_client = WebSocketPublishClient(session.publish_url, session.session_id)
+            # 创建翻译控制事件
+            translation_allowed_event = asyncio.Event()
+            # 默认不允许翻译，等待控制消息
+            
+            # 定义控制消息处理回调
+            async def control_message_handler(message):
+                code = message.get("code")
+                msg_text = message.get("message", "")
+
+                if code == "TRANSLATION_START_ALLOWED":
+                    self.logger.info(f"Session {session.session_id}: Translation start allowed: {msg_text}")
+                    translation_allowed_event.set()
+
+                elif code == "TRANSLATION_STOP_REQUIRED":
+                    self.logger.info(f"Session {session.session_id}: Translation stop required: {msg_text}")
+                    translation_allowed_event.clear()
+                    
+                    # 触发会话停止（复用现有逻辑）
+                    self.logger.info(f"Session {session.session_id}: Initiating session stop due to TRANSLATION_STOP_REQUIRED")
+                    if session.stop_event:
+                        session.stop_event.set()
+                else:
+                    self.logger.warning(f"Session {session.session_id}: Unknown control code: {code}")
+            
+            # Start WebSocket connection to publish URL with control callback
+            ws_client = WebSocketPublishClient(
+                session.publish_url, 
+                session.session_id,
+                control_message_callback=control_message_handler
+            )
             await ws_client.connect()
             session.status = "connected_to_publisher"
             
             # 保存WebSocket客户端引用，防止取消时泄漏
             session.publisher_ws = ws_client
             
-            # Start YouTube live translation stream
+            # Start YouTube live translation stream with translation control
             session.status = "processing_audio"
-            await self._stream_translated_audio(config, session, ws_client)
+            await self._stream_translated_audio(config, session, ws_client, translation_allowed_event)
             
         except asyncio.CancelledError:
             # 任务被取消（stop操作或其他取消场景）
@@ -282,18 +310,19 @@ class AudioStreamPublisher:
                 else:
                     self.logger.info(f"Session {session.session_id}: Keeping status as {current_status}")
     
-    async def _stream_translated_audio(self, config: Config, session: PublisherSession, ws_client):
+    async def _stream_translated_audio(self, config: Config, session: PublisherSession, ws_client, translation_allowed_event):
         """Stream translated PCM audio and subtitles to WebSocket publisher"""
         try:
             # 获取环境变量配置的宽限期时长
             finish_grace_timeout = float(os.getenv("FINISH_GRACE_TIMEOUT", "30.0"))  # 默认30秒
             
-            # Start YouTube live translation stream with stop control
+            # Start YouTube live translation stream with stop control and translation allowed event
             async for stream_data in translate_youtube_live_stream(
                 config, 
                 session.youtube_url, 
                 stop_event=session.stop_event,
-                finish_grace_timeout=finish_grace_timeout
+                finish_grace_timeout=finish_grace_timeout,
+                translation_allowed_event=translation_allowed_event
             ):
                 # 无条件转发所有流数据，包括 FinishSession 的响应
                 if not stream_data:
