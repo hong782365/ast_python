@@ -89,7 +89,7 @@ def map_event_to_subtitle_json(resp: TranslateResponseData) -> Optional[str]:
     
     return None
 
-async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None, stop_event: Optional[asyncio.Event] = None, finish_grace_timeout: float = 30.0):
+async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration_seconds: int = None, stop_event: Optional[asyncio.Event] = None, finish_grace_timeout: float = 30.0, translation_allowed_event: Optional[asyncio.Event] = None):
     """Generator function that yields translated audio chunks from YouTube live stream"""
     streamer = YouTubeLiveStreamer(youtube_url, duration_seconds or 3600)  # Default 1 hour
     
@@ -127,7 +127,7 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
         logging.info("🔇 Starting silence bridge immediately to prevent timeout...")
         silence_task = asyncio.create_task(
             send_silence_until_ready(
-                conn, session_id, audio_ready_event, timeout_seconds=30
+                conn, session_id, audio_ready_event, translation_allowed_event, timeout_seconds=30
             )
         )
         

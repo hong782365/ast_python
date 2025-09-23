@@ -264,10 +264,12 @@ class AudioStreamPublisher:
                 if code == "TRANSLATION_START_ALLOWED":
                     self.logger.info(f"Session {session.session_id}: Translation start allowed: {msg_text}")
                     translation_allowed_event.set()
+                    session.status = "translation_allowed"
 
                 elif code == "TRANSLATION_STOP_REQUIRED":
                     self.logger.info(f"Session {session.session_id}: Translation stop required: {msg_text}")
                     translation_allowed_event.clear()
+                    session.status = "stopping_due_to_control"  # 区分停止原因
                     
                     # 触发会话停止（复用现有逻辑）
                     self.logger.info(f"Session {session.session_id}: Initiating session stop due to TRANSLATION_STOP_REQUIRED")
