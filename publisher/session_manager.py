@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import time
@@ -352,7 +353,7 @@ class AudioStreamPublisher:
                             "code": "TRANSLATION_FAILED_SESSION",
                             "message": stream_data.content
                         }
-                        await ws_client.send_text_message(json.dumps(error_notification))
+                        await ws_client.send_text_message(json.dumps(error_notification, ensure_ascii=False))
                         self.logger.info(f"Session {session.session_id}: Error notification sent: {error_notification}")
                     except Exception as e:
                         self.logger.warning(f"Session {session.session_id}: Failed to send error notification (WebSocket may be closed): {e}")
