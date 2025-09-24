@@ -83,10 +83,10 @@ class WebSocketPublishClient:
             self.logger.warning(f"Session {self.session_id}: Heartbeat error: {e}")
     
     async def send_audio_frame(self, audio_chunk: bytes):
-        """Send audio chunk with automatic reconnection"""
+        """Send audio chunk (no auto-reconnection, fail fast)"""
         if not self.websocket:
-            self.logger.warning(f"Session {self.session_id}: Connection lost, attempting to reconnect...")
-            await self.connect()
+            self.logger.error(f"Session {self.session_id}: WebSocket not connected")
+            raise WebSocketException("WebSocket not connected")
         
         try:
             await self.websocket.send(audio_chunk)
@@ -100,29 +100,22 @@ class WebSocketPublishClient:
                     f"Session {self.session_id}: Sent {self.frame_count} audio chunks, "
                     f"rate: {chunk_rate:.1f} chunks/sec, total bytes: {self.frame_count * len(audio_chunk)}"
                 )
-                
         except (ConnectionClosed, WebSocketException) as e:
-            self.logger.warning(f"Session {self.session_id}: Send failed, reconnecting: {e}")
-            await self.connect()
-            # Retry sending the chunk
-            await self.websocket.send(audio_chunk)
-            self.frame_count += 1
+            self.logger.error(f"Session {self.session_id}: Send failed (no retry): {e}")
+            raise
     
     async def send_text_message(self, text_message: str):
-        """Send text message (JSON subtitle) with automatic reconnection"""
+        """Send text message (JSON subtitle, no auto-reconnection)"""
         if not self.websocket:
-            self.logger.warning(f"Session {self.session_id}: Connection lost, attempting to reconnect...")
-            await self.connect()
+            self.logger.error(f"Session {self.session_id}: WebSocket not connected")
+            raise WebSocketException("WebSocket not connected")
         
         try:
             await self.websocket.send(text_message)
             self.logger.debug(f"Session {self.session_id}: Sent text message: {text_message}")
-                
         except (ConnectionClosed, WebSocketException) as e:
-            self.logger.warning(f"Session {self.session_id}: Send text failed, reconnecting: {e}")
-            await self.connect()
-            # Retry sending the message
-            await self.websocket.send(text_message)
+            self.logger.error(f"Session {self.session_id}: Send text failed (no retry): {e}")
+            raise
     
     async def start_message_listener(self):
         """启动消息监听循环"""

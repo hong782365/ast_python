@@ -152,9 +152,14 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                     audio_ready_event=audio_ready_event,
                     ffmpeg_spawn_time=streamer.ffmpeg_spawn_time
                 ):
-                    # 检查是否需要停止（外部stop请求）
+                    # 检查外部停止信号
                     if stop_event and stop_event.is_set():
-                        logging.info(f"Stop event detected at chunk {chunk_count}, sending FinishSession and continuing to receive...")
+                        logging.info(f"🛑 Sender stopped due to stop_event at chunk {chunk_count}")
+                        break
+                    
+                    # 检查接收端是否已结束
+                    if finished.is_set():
+                        logging.info(f"🛑 Sender stopped due to finished event (receive loop ended) at chunk {chunk_count}")
                         break
                     
                     if not chunk:
@@ -275,6 +280,11 @@ async def translate_youtube_live_stream(conf: Config, youtube_url: str, duration
                         logging.error(f"Session failed, message: {resp.message} logid: {log_id}")
                         # 将错误信息作为特殊的 StreamData 传递给上层
                         await stream_queue.put(StreamData(data_type="error", content=resp.message))
+                        
+                        if stop_event:
+                            stop_event.set()
+                            logging.info("🛑 stop_event triggered due to SessionFailed/Canceled")
+                        
                         finished.set()
                         break
                     

@@ -302,6 +302,11 @@ class AudioStreamPublisher:
         except Exception as e:
             self.logger.error(f"Session {session.session_id}: Publishing failed: {e}")
             session.status = "failed"
+            
+            # 防御性确保 stop_event 已触发
+            if session.stop_event and not session.stop_event.is_set():
+                session.stop_event.set()
+                self.logger.warning(f"Session {session.session_id}: stop_event set as fallback in _publish_audio_stream")
         finally:
             # 只在正常完成时才设置completed，保留failed/stopped状态
             if session.session_id in self.sessions:
@@ -340,16 +345,25 @@ class AudioStreamPublisher:
                     await ws_client.send_text_message(stream_data.content)
                     self.logger.debug(f"Session {session.session_id}: Sent subtitle: {stream_data.content}")
                 elif stream_data.data_type == "error":
-                    # Handle live check errors (Codex方案错误处理)
-                    self.logger.warning(f"Session {session.session_id}: Live check failed, sending error to client")
-                    await ws_client.send_text_message(stream_data.content)
-                    self.logger.info(f"Session {session.session_id}: Error message sent: {stream_data.content}")
+                    # 尽力发送错误通知（如果 WebSocket 已断开会失败）
+                    try:
+                        error_notification = {
+                            "type": "system_control",
+                            "code": "TRANSLATION_FAILED_SESSION",
+                            "message": stream_data.content
+                        }
+                        await ws_client.send_text_message(json.dumps(error_notification))
+                        self.logger.info(f"Session {session.session_id}: Error notification sent: {error_notification}")
+                    except Exception as e:
+                        self.logger.warning(f"Session {session.session_id}: Failed to send error notification (WebSocket may be closed): {e}")
                     
-                    # 🔥审核者建议：检查失败时标记会话状态为failed
+                    # 确保触发 stop_event（防止翻译服务继续运行）
+                    if session.stop_event:
+                        session.stop_event.set()
+                        self.logger.info(f"Session {session.session_id}: stop_event triggered due to error from translation service")
+                    
                     session.status = "failed"
                     self.logger.info(f"Session {session.session_id}: Status set to 'failed' due to live check failure")
-                    
-                    # Error已发送，流程即将结束
                     break
                 
         except asyncio.CancelledError:
@@ -357,6 +371,12 @@ class AudioStreamPublisher:
             raise
         except Exception as e:
             self.logger.error(f"Session {session.session_id}: Streaming error: {e}")
+            
+            # 确保触发 stop_event（Publisher WebSocket 异常等）
+            if session.stop_event:
+                session.stop_event.set()
+                self.logger.info(f"Session {session.session_id}: stop_event triggered due to streaming exception")
+            
             raise
         finally:
             await ws_client.disconnect()
